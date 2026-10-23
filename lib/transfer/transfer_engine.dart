@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import '../file/chunk_manager.dart';
+import '../file/chunk_persistence_manager.dart';
 import '../file/file_hasher.dart';
 import '../metrics/metrics_collector.dart';
 import '../models/chunk.dart';
@@ -15,6 +16,7 @@ import '../scheduler/round_robin_scheduler.dart';
 import 'chunk_downloader.dart';
 import 'peer_concurrency_manager.dart';
 import 'reservation_manager.dart';
+import 'transfer_metrics_calculator.dart';
 import 'transfer_worker.dart';
 
 class TransferProgressEvent {
@@ -66,6 +68,8 @@ class TransferEngine {
   final Map<int, ChunkState> _chunkStates = {};
   final Map<int, int> _chunkFailureCounts = {};
   final MetricsCollector _metricsCollector = MetricsCollector();
+  final TransferMetricsCalculator _metricsCalculator = TransferMetricsCalculator();
+  final Map<String, int> _peerChunkContributions = {};
 
   TransferStatus _status = TransferStatus.starting;
   int _bytesTransferred = 0;
@@ -105,6 +109,7 @@ class TransferEngine {
   TransferStatus get status => _status;
   bool get isPreviewReady => _isPreviewReady;
   ChunkScheduler get activeScheduler => scheduler;
+  Map<String, int> get peerChunkContributions => Map.unmodifiable(_peerChunkContributions);
 
   double get progressPercent => manifest.fileSize > 0
       ? (_bytesTransferred / manifest.fileSize) * 100.0
@@ -142,6 +147,28 @@ class TransferEngine {
     try {
       // 1. Open writer session & preallocate full size immediately
       await _writerSession.open();
+
+      // Check for resumable checkpoint
+      final loadedCheckpoint = await ChunkPersistenceManager().loadCheckpoint(
+        fileId: manifest.fileId,
+        fileSha256: manifest.fileSha256,
+      );
+      if (loadedCheckpoint != null && loadedCheckpoint.isNotEmpty) {
+        for (final cid in loadedCheckpoint) {
+          if (cid >= 0 && cid < manifest.chunks.length && !_verifiedChunks.contains(cid)) {
+            _chunkStates[cid] = ChunkState.completed;
+            _verifiedChunks.add(cid);
+            final c = manifest.chunks.firstWhere((x) => x.chunkId == cid);
+            _bytesTransferred += c.length;
+            localServer.markChunkAvailable(cid, fileId: manifest.fileId);
+          }
+        }
+        _checkPreviewReadiness();
+        if (_verifiedChunks.length == manifest.chunkCount) {
+          unawaited(_finalizeTransferGate());
+          return await _completionCompleter!.future;
+        }
+      }
 
       _status = TransferStatus.transferring;
       _emitProgress();
@@ -288,6 +315,20 @@ class TransferEngine {
     // Check preview-readiness
     _checkPreviewReadiness();
 
+    // Record peer chunk contribution
+    _peerChunkContributions[sourcePeerId] =
+        (_peerChunkContributions[sourcePeerId] ?? 0) + 1;
+
+    // Persist verified chunk checkpoint asynchronously
+    unawaited(ChunkPersistenceManager().saveCheckpoint(
+      fileId: manifest.fileId,
+      fileName: manifest.fileName,
+      fileSha256: manifest.fileSha256,
+      fileSize: manifest.fileSize,
+      totalChunks: manifest.chunkCount,
+      verifiedChunks: _verifiedChunks,
+    ));
+
     // Make available immediately on local server for cooperative forwarding!
     localServer.markChunkAvailable(chunkId, fileId: manifest.fileId);
 
@@ -409,6 +450,7 @@ class TransferEngine {
     }
 
     // All 3 tiers verified successfully!
+    await ChunkPersistenceManager().deleteCheckpoint(manifest.fileId);
     _status = TransferStatus.completed;
     await _metricsCollector.finalizeTransfer();
 
@@ -487,12 +529,10 @@ class TransferEngine {
   }
 
   void _emitProgress({String? errorMessage}) {
-    final elapsedSec = _transferStopwatch.elapsedMicroseconds / 1000000.0;
-    final speed = elapsedSec > 0 ? (_bytesTransferred / (1024 * 1024)) / elapsedSec : 0.0;
-    final remainingBytes = manifest.fileSize - _bytesTransferred;
-    final remainingSec = (speed > 0 && remainingBytes > 0)
-        ? (remainingBytes / (speed * 1024 * 1024)).ceil()
-        : 0;
+    final metrics = _metricsCalculator.update(
+      totalBytesTransferred: _bytesTransferred,
+      totalFileSize: manifest.fileSize,
+    );
 
     final event = TransferProgressEvent(
       transferId: manifest.fileId,
@@ -500,8 +540,8 @@ class TransferEngine {
       progressPercent: progressPercent,
       bytesTransferred: _bytesTransferred,
       totalBytes: manifest.fileSize,
-      speedMbPerSec: speed,
-      remainingSeconds: remainingSec,
+      speedMbPerSec: metrics.smoothedSpeedMbPerSec,
+      remainingSeconds: metrics.remainingSeconds,
       errorMessage: errorMessage,
       isPreviewReady: _isPreviewReady,
     );

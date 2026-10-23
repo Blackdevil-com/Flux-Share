@@ -14,6 +14,7 @@ import '../../network/local_server.dart';
 import '../../network/network_utils.dart';
 import '../../repositories/device_repository.dart';
 import '../../room/room_manager.dart';
+import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
 
@@ -526,6 +527,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
       final selectedDevices = _nearbyDevices
           .where((d) => _selectedDeviceIds.contains(d.id))
           .toList();
+
+      await TransferSessionManager.instance.startHostSession(
+        server: server,
+        batchManifest: batchManifest,
+        receivers: selectedDevices,
+        roomPin: _roomPin,
+      );
 
       if (mounted) {
         Navigator.of(context).pushReplacement(

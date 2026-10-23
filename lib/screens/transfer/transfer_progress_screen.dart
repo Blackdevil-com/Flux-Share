@@ -9,6 +9,7 @@ import '../../network/local_server.dart';
 import '../../repositories/transfer_repository.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
 import '../../transfer/transfer_engine.dart';
+import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import 'transfer_complete_screen.dart';
 
@@ -59,10 +60,13 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   AIFailureDiagnosis? _currentDiagnosis;
   bool _optimizationApplied = false;
 
+  StreamSubscription<TransferProgressSnapshot>? _sessionSub;
   StreamSubscription<TransferProgressEvent>? _engineSub;
   StreamSubscription<BatchProgressEvent>? _batchSub;
   BatchProgressEvent? _batchEvent;
   BatchTransferCoordinator? _activeCoordinator;
+  Map<String, int> _peerContributions = {};
+  List<BatchTransferItem> _batchItems = [];
 
   bool _isPreviewReady = false;
   final Map<String, double> _receiverProgressMap = {};
@@ -94,7 +98,47 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _currentDiagnosis = AIFailureDiagnosis.normal;
     }
 
-    if (widget.batchCoordinator != null) {
+    final sessionManager = TransferSessionManager.instance;
+    if (sessionManager.hasActiveSession) {
+      final snap = sessionManager.currentSnapshot!;
+      _progressPercent = snap.progressPercent;
+      _speedMbPerSec = snap.speedMbPerSec;
+      _bytesTransferred = snap.bytesTransferred;
+      _remainingSeconds = snap.remainingSeconds;
+      _isPaused = snap.isPaused;
+      _isCancelled = snap.isCancelled;
+      _batchItems = snap.items;
+      _peerContributions = snap.peerChunkContributions;
+      _receiverProgressMap.addAll(snap.receiverProgressMap);
+      _isPreviewReady = snap.isPreviewReady;
+      if (sessionManager.activeCoordinator != null) {
+        _activeCoordinator = sessionManager.activeCoordinator;
+      }
+
+      _sessionSub = sessionManager.progressStream.listen((snap) {
+        if (!mounted) return;
+        setState(() {
+          _progressPercent = snap.progressPercent;
+          _speedMbPerSec = snap.speedMbPerSec;
+          _bytesTransferred = snap.bytesTransferred;
+          _remainingSeconds = snap.remainingSeconds;
+          _isPaused = snap.isPaused;
+          _isCancelled = snap.isCancelled;
+          _batchItems = snap.items;
+          _peerContributions = snap.peerChunkContributions;
+          _receiverProgressMap.addAll(snap.receiverProgressMap);
+          if (snap.isPreviewReady) {
+            _isPreviewReady = true;
+          }
+        });
+
+        if (snap.isCompleted) {
+          _onTransferSuccess();
+        } else if (snap.isFailed) {
+          _showErrorDialog(snap.errorMessage ?? 'Transfer verification failed.');
+        }
+      });
+    } else if (widget.batchCoordinator != null) {
       _activeCoordinator = widget.batchCoordinator;
       _bindBatchCoordinator(widget.batchCoordinator!);
     } else if (widget.engine != null) {
@@ -285,7 +329,14 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _isPaused = !_isPaused;
     });
 
-    if (_activeCoordinator != null) {
+    final sessionManager = TransferSessionManager.instance;
+    if (sessionManager.hasActiveSession) {
+      if (_isPaused) {
+        sessionManager.pause();
+      } else {
+        sessionManager.resume();
+      }
+    } else if (_activeCoordinator != null) {
       if (_isPaused) {
         _activeCoordinator!.pause();
       } else {
@@ -306,6 +357,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _isCancelled = true;
     });
 
+    final sessionManager = TransferSessionManager.instance;
+    if (sessionManager.hasActiveSession) {
+      await sessionManager.cancel();
+    }
     if (_activeCoordinator != null) {
       await _activeCoordinator!.cancel();
     } else if (widget.engine != null) {
@@ -341,6 +396,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
   @override
   void dispose() {
+    _sessionSub?.cancel();
     _engineSub?.cancel();
     _batchSub?.cancel();
     if (widget.isHost) {
@@ -564,86 +620,96 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                     const SizedBox(height: AppSpacing.s20),
 
                     // If batch items are present, show the itemized queue
-                    if (_batchEvent != null && _batchEvent!.items.isNotEmpty) ...[
-                      const SectionHeader(title: 'FILES IN BATCH'),
-                      ListView.builder(
-                        shrinkWrap: true,
-                        physics: const NeverScrollableScrollPhysics(),
-                        itemCount: _batchEvent!.items.length,
-                        itemBuilder: (context, idx) {
-                          final item = _batchEvent!.items[idx];
-                          return Container(
-                            margin: const EdgeInsets.only(bottom: 8),
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: AppColors.backgroundWhite,
-                              borderRadius: BorderRadius.circular(10),
-                              border: Border.all(color: AppColors.borderGray),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
+                    () {
+                      final displayBatchItems = _batchItems.isNotEmpty
+                          ? _batchItems
+                          : (_batchEvent?.items ?? []);
+                      if (displayBatchItems.isEmpty) return const SizedBox.shrink();
+
+                      return Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const SectionHeader(title: 'FILES IN BATCH'),
+                          ListView.builder(
+                            shrinkWrap: true,
+                            physics: const NeverScrollableScrollPhysics(),
+                            itemCount: displayBatchItems.length,
+                            itemBuilder: (context, idx) {
+                              final item = displayBatchItems[idx];
+                              return Container(
+                                margin: const EdgeInsets.only(bottom: 8),
+                                padding: const EdgeInsets.all(12),
+                                decoration: BoxDecoration(
+                                  color: AppColors.backgroundWhite,
+                                  borderRadius: BorderRadius.circular(10),
+                                  border: Border.all(color: AppColors.borderGray),
+                                ),
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
-                                    Icon(
-                                      _getStatusIcon(item.status),
-                                      size: 18,
-                                      color: _getStatusColor(item.status),
-                                    ),
-                                    const SizedBox(width: 8),
-                                    Expanded(
-                                      child: Text(
-                                        item.fileInfo.name,
-                                        style: const TextStyle(
-                                          fontWeight: FontWeight.w600,
-                                          fontSize: 13,
+                                    Row(
+                                      children: [
+                                        Icon(
+                                          _getStatusIcon(item.status),
+                                          size: 18,
+                                          color: _getStatusColor(item.status),
                                         ),
-                                        overflow: TextOverflow.ellipsis,
+                                        const SizedBox(width: 8),
+                                        Expanded(
+                                          child: Text(
+                                            item.fileInfo.name,
+                                            style: const TextStyle(
+                                              fontWeight: FontWeight.w600,
+                                              fontSize: 13,
+                                            ),
+                                            overflow: TextOverflow.ellipsis,
+                                          ),
+                                        ),
+                                        Text(
+                                          '${item.progressPercent.toInt()}%',
+                                          style: TextStyle(
+                                            fontWeight: FontWeight.bold,
+                                            fontSize: 12,
+                                            color: _getStatusColor(item.status),
+                                          ),
+                                        ),
+                                        if (item.status == TransferStatus.failed &&
+                                            _activeCoordinator != null) ...[
+                                          const SizedBox(width: 8),
+                                          IconButton(
+                                            icon: const Icon(Icons.refresh_rounded, size: 18),
+                                            tooltip: 'Retry File',
+                                            onPressed: () => _activeCoordinator!.retryFile(item.fileId),
+                                          ),
+                                        ],
+                                      ],
+                                    ),
+                                    const SizedBox(height: 6),
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(4),
+                                      child: LinearProgressIndicator(
+                                        value: (item.progressPercent / 100.0).clamp(0.0, 1.0),
+                                        minHeight: 6,
+                                        backgroundColor: AppColors.lightGray,
+                                        valueColor: AlwaysStoppedAnimation<Color>(_getStatusColor(item.status)),
                                       ),
                                     ),
-                                    Text(
-                                      '${item.progressPercent.toInt()}%',
-                                      style: TextStyle(
-                                        fontWeight: FontWeight.bold,
-                                        fontSize: 12,
-                                        color: _getStatusColor(item.status),
-                                      ),
-                                    ),
-                                    if (item.status == TransferStatus.failed &&
-                                        _activeCoordinator != null) ...[
-                                      const SizedBox(width: 8),
-                                      IconButton(
-                                        icon: const Icon(Icons.refresh_rounded, size: 18),
-                                        tooltip: 'Retry File',
-                                        onPressed: () => _activeCoordinator!.retryFile(item.fileId),
+                                    if (item.errorMessage != null) ...[
+                                      const SizedBox(height: 4),
+                                      Text(
+                                        item.errorMessage!,
+                                        style: const TextStyle(fontSize: 11, color: Colors.redAccent),
                                       ),
                                     ],
                                   ],
                                 ),
-                                const SizedBox(height: 6),
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(4),
-                                  child: LinearProgressIndicator(
-                                    value: (item.progressPercent / 100.0).clamp(0.0, 1.0),
-                                    minHeight: 6,
-                                    backgroundColor: AppColors.lightGray,
-                                    valueColor: AlwaysStoppedAnimation<Color>(_getStatusColor(item.status)),
-                                  ),
-                                ),
-                                if (item.errorMessage != null) ...[
-                                  const SizedBox(height: 4),
-                                  Text(
-                                    item.errorMessage!,
-                                    style: const TextStyle(fontSize: 11, color: Colors.redAccent),
-                                  ),
-                                ],
-                              ],
-                            ),
-                          );
-                        },
-                      ),
-                      const SizedBox(height: AppSpacing.s16),
-                    ],
+                              );
+                            },
+                          ),
+                          const SizedBox(height: AppSpacing.s16),
+                        ],
+                      );
+                    }(),
 
                     if (_isPreviewReady) ...[
                       Container(
@@ -803,6 +869,46 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                     if (widget.engine != null) ...[
                       const SizedBox(height: AppSpacing.s16),
                       LiveSwarmVisualization(engine: widget.engine!),
+                    ],
+                    if (_peerContributions.isNotEmpty) ...[
+                      const SizedBox(height: AppSpacing.s16),
+                      const SectionHeader(title: 'SWARM PEER CONTRIBUTIONS'),
+                      Container(
+                        padding: const EdgeInsets.all(AppSpacing.s16),
+                        decoration: BoxDecoration(
+                          color: AppColors.backgroundWhite,
+                          borderRadius: AppShapes.cardBorderRadius,
+                          border: Border.all(color: AppColors.borderGray),
+                        ),
+                        child: Column(
+                          children: _peerContributions.entries.map((entry) {
+                            return Padding(
+                              padding: const EdgeInsets.symmetric(vertical: 4),
+                              child: Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  Row(
+                                    children: [
+                                      const Icon(Icons.hub_rounded, size: 16, color: AppColors.mediumGray),
+                                      const SizedBox(width: 8),
+                                      Text(
+                                        entry.key.length > 12
+                                            ? '${entry.key.substring(0, 10)}...'
+                                            : entry.key,
+                                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+                                      ),
+                                    ],
+                                  ),
+                                  Text(
+                                    '${entry.value} chunks',
+                                    style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
+                                  ),
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ),
                     ],
                   ],
                 ),

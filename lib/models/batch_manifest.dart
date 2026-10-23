@@ -1,3 +1,4 @@
+import 'file_info.dart';
 import 'manifest.dart';
 
 /// Represents a multi-file batch transfer manifest containing individual file manifests.
@@ -12,6 +13,8 @@ class BatchManifest {
     required this.manifests,
   })  : totalFiles = manifests.length,
         totalBytes = manifests.fold(0, (sum, m) => sum + m.fileSize);
+
+  String get formattedTotalSize => FileInfo.formatBytes(totalBytes);
 
   Manifest? findManifest(String fileId) {
     for (final m in manifests) {

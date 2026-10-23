@@ -10,6 +10,7 @@ import '../../network/http_client.dart';
 import '../../network/local_server.dart';
 import '../../network/websocket_service.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
+import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
 
@@ -800,6 +801,11 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                             coordinatorPeerId: hostPeer.peerId,
                             concurrentWorkers: settings.maxParallelConnections,
                             scheduler: settings.createConfiguredScheduler(),
+                          );
+
+                          await TransferSessionManager.instance.startReceiverBatchSession(
+                            coordinator: coordinator,
+                            batchManifest: batch,
                           );
 
                           coordinator.start();
