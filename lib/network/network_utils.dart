@@ -1,16 +1,22 @@
 import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 
 /// Network utilities for interface detection, IP resolution, and reachability.
 class NetworkUtils {
+  @visibleForTesting
+  static String? customLocalIp;
+
   /// Discovers local non-loopback IPv4 address on active LAN interfaces.
   /// Prioritizes Wi-Fi (wlan, ap, p2p) and Ethernet (eth), filtering out virtual/VPN/cellular.
   static Future<String?> getLocalIpAddress() async {
+    if (customLocalIp != null) return customLocalIp;
+
     try {
       final interfaces = await NetworkInterface.list(
         includeLoopback: false,
         type: InternetAddressType.IPv4,
-      );
+      ).timeout(const Duration(seconds: 1), onTimeout: () => []);
 
       // Prioritize Wi-Fi and Ethernet
       interfaces.sort((a, b) {

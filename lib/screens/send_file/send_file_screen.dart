@@ -17,10 +17,47 @@ import '../../room/room_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
 
+enum FilePreparationStatus {
+  selected,
+  queued,
+  preparing,
+  hashing,
+  ready,
+  manifestReady,
+  hostingReady,
+  error,
+  cancelled;
+
+  bool get isManifestReady =>
+      this == FilePreparationStatus.ready ||
+      this == FilePreparationStatus.manifestReady ||
+      this == FilePreparationStatus.hostingReady;
+}
+
 class PickedFileItem {
-  final File file;
-  final FileInfo info;
-  const PickedFileItem({required this.file, required this.info});
+  final String id;
+  int jobId;
+  File file;
+  FileInfo info;
+  FilePreparationStatus status;
+  Manifest? manifest;
+  ManifestProgress? progress;
+  String? errorMessage;
+  bool isCancelled;
+
+  PickedFileItem({
+    required this.id,
+    this.jobId = 1,
+    required this.file,
+    required this.info,
+    this.status = FilePreparationStatus.selected,
+    this.manifest,
+    this.progress,
+    this.errorMessage,
+    this.isCancelled = false,
+  });
+
+  bool get isReady => status.isManifestReady && manifest != null;
 }
 
 class SendFileScreen extends StatefulWidget {
@@ -42,6 +79,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
   final DiscoveryService _discoveryService = DiscoveryService();
   final List<PickedFileItem> _selectedFiles = [];
   final Set<String> _selectedDeviceIds = {};
+  final ValueNotifier<int> _manifestUpdateNotifier = ValueNotifier<int>(0);
+  bool _isQueueProcessing = false;
   List<Device> _nearbyDevices = [];
   bool _isLoadingDevices = true;
   late String _roomPin;
@@ -52,17 +91,32 @@ class _SendFileScreenState extends State<SendFileScreen> {
     super.initState();
     _generateRoomPin();
     if (widget.initialFile != null) {
+      final file = File(widget.initialFile!.id);
       _selectedFiles.add(
         PickedFileItem(
-          file: File(widget.initialFile!.id),
+          id: widget.initialFile!.id,
+          jobId: 1,
+          file: file,
           info: widget.initialFile!,
+          status: FilePreparationStatus.selected,
         ),
       );
+      _startPreparationQueue();
     }
     if (widget.initialDeviceId != null) {
       _selectedDeviceIds.add(widget.initialDeviceId!);
     }
     _loadDevices();
+  }
+
+  @override
+  void dispose() {
+    for (final item in _selectedFiles) {
+      item.isCancelled = true;
+      item.jobId++;
+    }
+    _manifestUpdateNotifier.dispose();
+    super.dispose();
   }
 
   void _generateRoomPin() {
@@ -84,6 +138,27 @@ class _SendFileScreenState extends State<SendFileScreen> {
   int get _totalSelectedBytes =>
       _selectedFiles.fold(0, (sum, item) => sum + item.info.sizeBytes);
 
+  int get _readyCount =>
+      _selectedFiles.where((i) => i.status == FilePreparationStatus.manifestReady).length;
+
+  int get _preparingCount => _selectedFiles
+      .where((i) =>
+          i.status == FilePreparationStatus.preparing ||
+          i.status == FilePreparationStatus.hashing)
+      .length;
+
+  int get _queuedCount => _selectedFiles
+      .where((i) => i.status == FilePreparationStatus.selected)
+      .length;
+
+  String get _batchSummaryText {
+    final total = _selectedFiles.length;
+    if (_readyCount == total && total > 0) {
+      return '$total ${total == 1 ? 'file' : 'files'} selected ($_formattedTotalBytes) · All manifests ready';
+    }
+    return '$total ${total == 1 ? 'file' : 'files'} · $_readyCount ready · $_preparingCount preparing · $_queuedCount queued';
+  }
+
   String get _formattedTotalBytes {
     final bytes = _totalSelectedBytes;
     if (bytes < 1024) return '$bytes B';
@@ -94,45 +169,66 @@ class _SendFileScreenState extends State<SendFileScreen> {
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
-  String _getCanonicalPath(File file) {
-    try {
-      return file.resolveSymbolicLinksSync();
-    } catch (_) {
-      return file.absolute.path;
+  bool get _canStartTransfer {
+    if (_selectedFiles.isEmpty) return false;
+    return _selectedFiles.every((i) => i.isReady);
+  }
+
+  String get _transferButtonText {
+    if (_selectedFiles.isEmpty) {
+      return 'SELECT FILE TO SHARE';
     }
+    final total = _selectedFiles.length;
+    final ready = _readyCount;
+    if (_canStartTransfer) {
+      return total > 1 ? 'START BATCH TRANSFER ($total)' : 'START TRANSFER';
+    }
+    final hasError = _selectedFiles.any((i) => i.status == FilePreparationStatus.error);
+    if (hasError) {
+      return 'RESOLVE ERRORS BEFORE TRANSFER';
+    }
+    final hasCancelled = _selectedFiles.any((i) => i.status == FilePreparationStatus.cancelled);
+    if (hasCancelled) {
+      return 'PREPARATION INCOMPLETE';
+    }
+    return 'PREPARING MANIFESTS ($ready/$total READY)';
   }
 
   Future<void> _openFileBrowser() async {
     try {
-      final pickedFiles = await FilePickerService.pickMultipleFiles();
-      if (pickedFiles.isEmpty) {
+      final payloads = await FilePickerService.pickMultipleFilePayloads();
+      if (payloads.isEmpty) {
         debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
         return;
       }
 
       int addedCount = 0;
-      for (final file in pickedFiles) {
-        if (!await file.exists()) {
-          debugPrint('[FluxShare] Inaccessible file: ${file.path}');
+      for (final payload in payloads) {
+        final path = payload.file.path;
+        if (_selectedFiles.any((item) =>
+            item.file.path == path ||
+            (item.info.name == payload.name && item.info.sizeBytes == payload.sizeBytes))) {
           continue;
         }
 
-        // Prevent duplicate file selection by canonical path
-        final canonicalPath = _getCanonicalPath(file);
-        if (_selectedFiles.any((item) => _getCanonicalPath(item.file) == canonicalPath)) {
-          continue;
-        }
-
-        final info = await FileInfo.fromFile(file);
-        _selectedFiles.add(PickedFileItem(file: file, info: info));
+        final item = PickedFileItem(
+          id: '${payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+          jobId: 1,
+          file: payload.file,
+          info: payload.toFileInfo(),
+          status: FilePreparationStatus.selected,
+        );
+        _selectedFiles.add(item);
         addedCount++;
       }
 
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
 
+      // Immediate UI update: all selected files appear on screen instantaneously
       if (mounted) {
         setState(() {});
-        if (addedCount == 0 && pickedFiles.isNotEmpty) {
+        _manifestUpdateNotifier.value++;
+        if (addedCount == 0 && payloads.isNotEmpty) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
               content: Text('Selected files are already in the transfer list.'),
@@ -141,6 +237,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
           );
         }
       }
+
+      // Start asynchronous manifest preparation pipeline
+      _startPreparationQueue();
     } catch (e) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -153,19 +252,200 @@ class _SendFileScreenState extends State<SendFileScreen> {
     }
   }
 
+  Future<void> _changeFileAt(int index) async {
+    if (index < 0 || index >= _selectedFiles.length) return;
+
+    final targetItem = _selectedFiles[index];
+
+    try {
+      final replacement = await FilePickerService.pickSingleFilePayload();
+      if (replacement == null) {
+        // User cancelled picker: retain existing selection and preparation state
+        debugPrint('[FluxShare] Change file cancelled by user, preserving previous selection');
+        return;
+      }
+
+      // Check if the replacement file is already in another item
+      final replacementPath = replacement.file.path;
+      final duplicateIndex = _selectedFiles.indexWhere((item) =>
+          item != targetItem &&
+          (item.file.path == replacementPath ||
+              (item.info.name == replacement.name && item.info.sizeBytes == replacement.sizeBytes)));
+      if (duplicateIndex != -1) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Selected file is already in the transfer list.'),
+              backgroundColor: AppColors.primaryBlack,
+            ),
+          );
+        }
+        return;
+      }
+
+      // Invalidate existing preparation job immediately
+      targetItem.isCancelled = true;
+      final newJobId = ++targetItem.jobId;
+
+      setState(() {
+        targetItem.file = replacement.file;
+        targetItem.info = replacement.toFileInfo();
+        targetItem.status = FilePreparationStatus.selected;
+        targetItem.manifest = null;
+        targetItem.progress = null;
+        targetItem.errorMessage = null;
+        targetItem.isCancelled = false;
+      });
+      _manifestUpdateNotifier.value++;
+
+      debugPrint('[FluxShare] File at index $index replaced with "${replacement.name}" (jobId: $newJobId)');
+
+      // Immediately trigger preparation queue for the replacement
+      _startPreparationQueue();
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not replace file: $e'),
+            backgroundColor: AppColors.primaryBlack,
+          ),
+        );
+      }
+    }
+  }
+
+  void _cancelPreparation(PickedFileItem item) {
+    item.isCancelled = true;
+    ++item.jobId;
+    setState(() {
+      item.status = FilePreparationStatus.cancelled;
+      item.progress = null;
+    });
+    _manifestUpdateNotifier.value++;
+    debugPrint('[FluxShare] Preparation cancelled for "${item.info.name}"');
+  }
+
+  void _startPreparationQueue() {
+    if (_isQueueProcessing) return;
+    _isQueueProcessing = true;
+    _processPreparationQueue();
+  }
+
+  Future<void> _processPreparationQueue() async {
+    while (mounted) {
+      PickedFileItem? targetItem;
+      for (final item in _selectedFiles) {
+        if (item.status == FilePreparationStatus.selected) {
+          targetItem = item;
+          break;
+        }
+      }
+
+      if (targetItem == null) {
+        break;
+      }
+
+      final int activeJobId = targetItem.jobId;
+
+      try {
+        if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+          setState(() {
+            targetItem!.status = FilePreparationStatus.preparing;
+          });
+          _manifestUpdateNotifier.value++;
+        }
+
+        if (!await targetItem.file.exists()) {
+          if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+            setState(() {
+              targetItem!.status = FilePreparationStatus.error;
+              targetItem.errorMessage = 'File not found on disk';
+            });
+            _manifestUpdateNotifier.value++;
+          }
+          continue;
+        }
+
+        if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+          setState(() {
+            targetItem!.status = FilePreparationStatus.hashing;
+          });
+          _manifestUpdateNotifier.value++;
+        }
+
+        final manifest = await ManifestService.generateManifest(
+          targetItem.file,
+          fileId: targetItem.id,
+          onProgress: (p) {
+            if (mounted && targetItem!.jobId == activeJobId && !targetItem.isCancelled) {
+              setState(() {
+                targetItem!.progress = p;
+              });
+              _manifestUpdateNotifier.value++;
+            }
+          },
+          isCancelled: () =>
+              !mounted || targetItem!.jobId != activeJobId || targetItem.isCancelled,
+        );
+
+        if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+          setState(() {
+            targetItem!.manifest = manifest;
+            targetItem.status = FilePreparationStatus.manifestReady;
+            targetItem.errorMessage = null;
+          });
+          _manifestUpdateNotifier.value++;
+        }
+      } catch (e) {
+        if (mounted && targetItem.jobId == activeJobId) {
+          setState(() {
+            if (targetItem!.isCancelled) {
+              targetItem.status = FilePreparationStatus.cancelled;
+            } else {
+              targetItem.status = FilePreparationStatus.error;
+              targetItem.errorMessage = e.toString();
+            }
+          });
+          _manifestUpdateNotifier.value++;
+        }
+      }
+    }
+    _isQueueProcessing = false;
+  }
+
+  void _retryPreparation(PickedFileItem item) {
+    item.isCancelled = false;
+    item.status = FilePreparationStatus.selected;
+    item.errorMessage = null;
+    item.progress = null;
+    ++item.jobId;
+    setState(() {});
+    _manifestUpdateNotifier.value++;
+    _startPreparationQueue();
+  }
+
   void _removeFileAt(int index) {
     if (index >= 0 && index < _selectedFiles.length) {
+      final removed = _selectedFiles[index];
+      removed.isCancelled = true;
+      ++removed.jobId;
       setState(() {
         _selectedFiles.removeAt(index);
       });
+      _manifestUpdateNotifier.value++;
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
     }
   }
 
   void _clearAllFiles() {
+    for (final item in _selectedFiles) {
+      item.isCancelled = true;
+      ++item.jobId;
+    }
     setState(() {
       _selectedFiles.clear();
     });
+    _manifestUpdateNotifier.value++;
     debugPrint('[FluxShare] Selection state contains: 0 files');
   }
 
@@ -198,56 +478,23 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
   Future<void> _startTransfer() async {
     debugPrint('[FluxShare] Start Transfer received: ${_selectedFiles.length} files');
-    if (_selectedFiles.isEmpty) {
+    if (!_canStartTransfer) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select at least one file to transfer')),
+        const SnackBar(content: Text('Please wait for all file manifests to finish preparing')),
       );
       return;
     }
 
-    // Verify all selected files exist on disk
-    for (final item in _selectedFiles) {
-      if (!await item.file.exists()) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('File "${item.info.name}" not found on disk')),
-        );
-        return;
-      }
-    }
-
-    // Show loading dialog while hashing and chunking
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => Center(
-        child: Card(
-          child: Padding(
-            padding: const EdgeInsets.all(24.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const CircularProgressIndicator(color: AppColors.primaryBlack),
-                const SizedBox(height: 16),
-                Text(
-                  'Hashing ${_selectedFiles.length} ${_selectedFiles.length == 1 ? 'file' : 'files'} & preparing manifests...',
-                  style: const TextStyle(fontWeight: FontWeight.w600),
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-
     try {
-      final List<Manifest> manifests = [];
-      final List<({Manifest manifest, File file})> batchItems = [];
-
+      // Mark all files as hosting ready
       for (final item in _selectedFiles) {
-        final m = await ManifestService.createManifest(item.file);
-        manifests.add(m);
-        batchItems.add((manifest: m, file: item.file));
+        item.status = FilePreparationStatus.hostingReady;
       }
+      _manifestUpdateNotifier.value++;
+
+      final List<Manifest> manifests = _selectedFiles.map((i) => i.manifest!).toList();
+      final List<({Manifest manifest, File file})> batchItems =
+          _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
 
       final batchManifest = BatchManifest(
         batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
@@ -281,7 +528,6 @@ class _SendFileScreenState extends State<SendFileScreen> {
           .toList();
 
       if (mounted) {
-        Navigator.of(context).pop(); // dismiss loading dialog
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder: (context) => TransferProgressScreen(
@@ -299,7 +545,6 @@ class _SendFileScreenState extends State<SendFileScreen> {
       }
     } catch (e) {
       if (mounted) {
-        Navigator.of(context).pop();
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error preparing transfer: $e')),
         );
@@ -310,7 +555,6 @@ class _SendFileScreenState extends State<SendFileScreen> {
   @override
   Widget build(BuildContext context) {
     debugPrint('[FluxShare] UI displays: ${_selectedFiles.length} files');
-    final bool canStartTransfer = _selectedFiles.isNotEmpty;
 
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,
@@ -401,8 +645,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
                   if (_selectedFiles.isEmpty)
                     FilePickerCard(
                       onTap: _openFileBrowser,
-                      title: 'Tap to select files',
-                      subtitle: 'Select multiple files or documents',
+                      title: 'Select File to Share',
+                      subtitle: 'Tap to select files. Hashing and manifest preparation begin immediately.',
                     )
                   else ...[
                     // Selection summary bar
@@ -418,7 +662,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
                         children: [
                           Expanded(
                             child: Text(
-                              '${_selectedFiles.length} ${_selectedFiles.length == 1 ? 'file' : 'files'} selected ($_formattedTotalBytes)',
+                              _batchSummaryText,
                               style: const TextStyle(
                                 fontWeight: FontWeight.bold,
                                 fontSize: 13,
@@ -459,47 +703,95 @@ class _SendFileScreenState extends State<SendFileScreen> {
                       itemCount: _selectedFiles.length,
                       itemBuilder: (context, index) {
                         final item = _selectedFiles[index];
+                        final isPreparing = item.status == FilePreparationStatus.preparing ||
+                            item.status == FilePreparationStatus.hashing;
+
                         return Container(
-                          margin: const EdgeInsets.only(bottom: 8),
-                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          margin: const EdgeInsets.only(bottom: 10),
+                          padding: const EdgeInsets.all(12),
                           decoration: BoxDecoration(
                             color: AppColors.backgroundWhite,
                             borderRadius: BorderRadius.circular(12),
-                            border: Border.all(color: AppColors.borderGray),
+                            border: Border.all(
+                              color: item.status == FilePreparationStatus.error
+                                  ? Colors.redAccent.withValues(alpha: 0.5)
+                                  : (item.status == FilePreparationStatus.manifestReady
+                                      ? Colors.green.withValues(alpha: 0.4)
+                                      : AppColors.borderGray),
+                              width: 1.0,
+                            ),
                           ),
-                          child: Row(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
                             children: [
-                              Container(
-                                width: 38,
-                                height: 38,
-                                decoration: BoxDecoration(
-                                  color: AppColors.lightGray,
-                                  borderRadius: BorderRadius.circular(8),
-                                ),
-                                child: Icon(
-                                  _getFileIcon(item.info.type),
-                                  size: 20,
-                                  color: AppColors.primaryBlack,
-                                ),
+                              Row(
+                                children: [
+                                  Container(
+                                    width: 40,
+                                    height: 40,
+                                    decoration: BoxDecoration(
+                                      color: AppColors.lightGray,
+                                      borderRadius: BorderRadius.circular(8),
+                                    ),
+                                    child: Icon(
+                                      _getFileIcon(item.info.type),
+                                      size: 20,
+                                      color: AppColors.primaryBlack,
+                                    ),
+                                  ),
+                                  const SizedBox(width: 12),
+                                  Expanded(
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
+                                      children: [
+                                        Text(
+                                          item.info.name,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: const TextStyle(
+                                            fontWeight: FontWeight.w600,
+                                            fontSize: 13,
+                                            color: AppColors.primaryBlack,
+                                          ),
+                                        ),
+                                        const SizedBox(height: 2),
+                                        Text(
+                                          '${item.info.formattedSize} • ${item.info.type.displayName}',
+                                          style: const TextStyle(
+                                            fontSize: 11,
+                                            color: AppColors.mediumGray,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                  IconButton(
+                                    icon: const Icon(Icons.close_rounded, size: 18),
+                                    tooltip: 'Remove file',
+                                    onPressed: () => _removeFileAt(index),
+                                  ),
+                                ],
                               ),
-                              const SizedBox(width: 12),
-                              Expanded(
-                                child: Column(
-                                  crossAxisAlignment: CrossAxisAlignment.start,
+                              const SizedBox(height: 8),
+                              // Status & Progress Section
+                              if (isPreparing) ...[
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
                                   children: [
                                     Text(
-                                      item.info.name,
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
+                                      item.status == FilePreparationStatus.hashing
+                                          ? 'Calculating SHA-256'
+                                          : 'Building chunk manifest',
                                       style: const TextStyle(
+                                        fontSize: 11,
                                         fontWeight: FontWeight.w600,
-                                        fontSize: 13,
                                         color: AppColors.primaryBlack,
                                       ),
                                     ),
-                                    const SizedBox(height: 2),
                                     Text(
-                                      '${item.info.formattedSize} • ${item.info.type.displayName}',
+                                      item.progress != null
+                                          ? '${item.progress!.formattedProcessedBytes} / ${item.info.formattedSize} processed · ${item.progress!.percentage}%'
+                                          : 'Starting...',
                                       style: const TextStyle(
                                         fontSize: 11,
                                         color: AppColors.mediumGray,
@@ -507,12 +799,196 @@ class _SendFileScreenState extends State<SendFileScreen> {
                                     ),
                                   ],
                                 ),
-                              ),
-                              IconButton(
-                                icon: const Icon(Icons.close_rounded, size: 18),
-                                tooltip: 'Remove file',
-                                onPressed: () => _removeFileAt(index),
-                              ),
+                                const SizedBox(height: 6),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(3),
+                                  child: LinearProgressIndicator(
+                                    value: item.progress?.progress,
+                                    backgroundColor: AppColors.lightGray,
+                                    valueColor: const AlwaysStoppedAnimation(AppColors.primaryBlack),
+                                    minHeight: 4,
+                                  ),
+                                ),
+                                const SizedBox(height: 10),
+                                Row(
+                                  children: [
+                                    OutlinedButton.icon(
+                                      onPressed: () => _changeFileAt(index),
+                                      icon: const Icon(Icons.swap_horiz_rounded, size: 15),
+                                      label: const Text('Change File'),
+                                      style: OutlinedButton.styleFrom(
+                                        foregroundColor: AppColors.primaryBlack,
+                                        side: const BorderSide(color: AppColors.borderGray),
+                                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                        minimumSize: Size.zero,
+                                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                        textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    OutlinedButton.icon(
+                                      onPressed: () => _cancelPreparation(item),
+                                      icon: const Icon(Icons.cancel_outlined, size: 15, color: Colors.redAccent),
+                                      label: const Text('Cancel', style: TextStyle(color: Colors.redAccent)),
+                                      style: OutlinedButton.styleFrom(
+                                        side: BorderSide(color: Colors.redAccent.withValues(alpha: 0.4)),
+                                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                        minimumSize: Size.zero,
+                                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                        textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ] else if (item.status == FilePreparationStatus.manifestReady) ...[
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.check_circle_rounded, size: 15, color: Colors.green),
+                                        SizedBox(width: 4),
+                                        Text(
+                                          'Manifest Ready · Verified SHA-256',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.bold,
+                                            color: Colors.green,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    TextButton.icon(
+                                      onPressed: () => _changeFileAt(index),
+                                      icon: const Icon(Icons.swap_horiz_rounded, size: 14, color: AppColors.primaryBlack),
+                                      label: const Text('Change', style: TextStyle(fontSize: 11, color: AppColors.primaryBlack, fontWeight: FontWeight.w600)),
+                                      style: TextButton.styleFrom(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        minimumSize: Size.zero,
+                                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ] else if (item.status == FilePreparationStatus.cancelled) ...[
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.cancel_outlined, size: 15, color: Colors.orange[800]),
+                                        const SizedBox(width: 4),
+                                        Text(
+                                          'Preparation Cancelled',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            fontWeight: FontWeight.w600,
+                                            color: Colors.orange[800],
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        TextButton.icon(
+                                          onPressed: () => _retryPreparation(item),
+                                          icon: const Icon(Icons.refresh_rounded, size: 14, color: AppColors.primaryBlack),
+                                          label: const Text('Resume / Retry', style: TextStyle(fontSize: 11, color: AppColors.primaryBlack, fontWeight: FontWeight.w600)),
+                                          style: TextButton.styleFrom(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            minimumSize: Size.zero,
+                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                          ),
+                                        ),
+                                        const SizedBox(width: 6),
+                                        TextButton.icon(
+                                          onPressed: () => _changeFileAt(index),
+                                          icon: const Icon(Icons.swap_horiz_rounded, size: 14, color: AppColors.primaryBlack),
+                                          label: const Text('Change', style: TextStyle(fontSize: 11, color: AppColors.primaryBlack, fontWeight: FontWeight.w600)),
+                                          style: TextButton.styleFrom(
+                                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                            minimumSize: Size.zero,
+                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ] else if (item.status == FilePreparationStatus.error) ...[
+                                Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      'Error: ${item.errorMessage ?? 'Preparation failed'}',
+                                      style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                                    ),
+                                    const SizedBox(height: 6),
+                                    Row(
+                                      children: [
+                                        OutlinedButton.icon(
+                                          onPressed: () => _retryPreparation(item),
+                                          icon: const Icon(Icons.refresh_rounded, size: 14, color: Colors.redAccent),
+                                          label: const Text('Retry', style: TextStyle(color: Colors.redAccent)),
+                                          style: OutlinedButton.styleFrom(
+                                            side: BorderSide(color: Colors.redAccent.withValues(alpha: 0.4)),
+                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                            minimumSize: Size.zero,
+                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                            textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 8),
+                                        OutlinedButton.icon(
+                                          onPressed: () => _changeFileAt(index),
+                                          icon: const Icon(Icons.swap_horiz_rounded, size: 14, color: AppColors.primaryBlack),
+                                          label: const Text('Change File'),
+                                          style: OutlinedButton.styleFrom(
+                                            side: const BorderSide(color: AppColors.borderGray),
+                                            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                                            minimumSize: Size.zero,
+                                            tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                            textStyle: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ],
+                                ),
+                              ] else ...[
+                                Row(
+                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                  children: [
+                                    const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(Icons.hourglass_empty_rounded, size: 14, color: AppColors.mediumGray),
+                                        SizedBox(width: 4),
+                                        Text(
+                                          'Queued for preparation...',
+                                          style: TextStyle(
+                                            fontSize: 11,
+                                            color: AppColors.mediumGray,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                    TextButton.icon(
+                                      onPressed: () => _changeFileAt(index),
+                                      icon: const Icon(Icons.swap_horiz_rounded, size: 14, color: AppColors.primaryBlack),
+                                      label: const Text('Change', style: TextStyle(fontSize: 11, color: AppColors.primaryBlack, fontWeight: FontWeight.w600)),
+                                      style: TextButton.styleFrom(
+                                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                                        minimumSize: Size.zero,
+                                        tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ],
                             ],
                           ),
                         );
@@ -609,11 +1085,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
             ),
             child: SafeArea(
               child: PrimaryButton(
-                text: _selectedFiles.length > 1
-                    ? 'START BATCH TRANSFER (${_selectedFiles.length})'
-                    : 'START TRANSFER',
+                text: _transferButtonText,
                 icon: Icons.send_rounded,
-                onPressed: canStartTransfer ? _startTransfer : null,
+                onPressed: _canStartTransfer ? _startTransfer : null,
               ),
             ),
           ),

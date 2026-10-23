@@ -1,6 +1,34 @@
 import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
+import '../models/file_info.dart' as fi;
+
+/// Immutable payload containing metadata immediately extracted upon file selection.
+class SelectedFilePayload {
+  final File file;
+  final String name;
+  final int sizeBytes;
+  final String extension;
+  final fi.FileType type;
+
+  const SelectedFilePayload({
+    required this.file,
+    required this.name,
+    required this.sizeBytes,
+    required this.extension,
+    required this.type,
+  });
+
+  fi.FileInfo toFileInfo() {
+    return fi.FileInfo.fromMetadata(
+      path: file.path,
+      name: name,
+      sizeBytes: sizeBytes,
+      extension: extension,
+      type: type,
+    );
+  }
+}
 
 /// Real file picker service with robust path resolution, byte fallback,
 /// comprehensive diagnostics, and test hook support.
@@ -10,15 +38,43 @@ class FilePickerService {
   static Future<List<File>> Function()? customMultiplePickerHandler;
 
   @visibleForTesting
+  static Future<List<SelectedFilePayload>> Function()? customPayloadPickerHandler;
+
+  @visibleForTesting
   static Future<File?> Function()? customSinglePickerHandler;
 
-  static Future<File?> pickSingleFile() async {
+  @visibleForTesting
+  static Future<SelectedFilePayload?> Function()? customSinglePayloadPickerHandler;
+
+  /// Selects a single replacement file and immediately returns a lightweight metadata payload
+  /// without requiring expensive synchronous disk I/O.
+  static Future<SelectedFilePayload?> pickSingleFilePayload() async {
+    if (customSinglePayloadPickerHandler != null) {
+      final payload = await customSinglePayloadPickerHandler!();
+      debugPrint('[FluxShare] Single picker returned payload: ${payload?.name}');
+      return payload;
+    }
+
     if (customSinglePickerHandler != null) {
-      return customSinglePickerHandler!();
+      final f = await customSinglePickerHandler!();
+      if (f == null) return null;
+      final name = f.uri.pathSegments.isNotEmpty ? f.uri.pathSegments.last : 'file';
+      final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+      int size = 0;
+      try {
+        if (f.existsSync()) size = f.lengthSync();
+      } catch (_) {}
+      return SelectedFilePayload(
+        file: f,
+        name: name,
+        sizeBytes: size,
+        extension: ext,
+        type: fi.FileInfo.detectFileType(ext),
+      );
     }
 
     try {
-      debugPrint('[FluxShare] Requesting native single-file picker (allowMultiple: false)...');
+      debugPrint('[FluxShare] Requesting native single-file picker (allowMultiple: false, type: FileType.any)...');
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: false,
         type: FileType.any,
@@ -28,28 +84,66 @@ class FilePickerService {
         return null;
       }
 
-      final fileItem = result.files.first;
-      if (fileItem.path != null && fileItem.path!.isNotEmpty) {
-        debugPrint('[FluxShare] Single picker returned: ${fileItem.path}');
-        return File(fileItem.path!);
-      } else if (fileItem.bytes != null) {
+      final f = result.files.first;
+      File? resolvedFile;
+      if (f.path != null && f.path!.isNotEmpty) {
+        resolvedFile = File(f.path!);
+      } else if (f.bytes != null) {
         final tempDir = Directory.systemTemp;
-        final tempFile = File('${tempDir.path}/${fileItem.name}');
-        await tempFile.writeAsBytes(fileItem.bytes!, flush: true);
-        debugPrint('[FluxShare] Single picker cached bytes to temp: ${tempFile.path}');
-        return tempFile;
+        final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
+        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
+        await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+        debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
+      }
+
+      if (resolvedFile != null) {
+        final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
+        return SelectedFilePayload(
+          file: resolvedFile,
+          name: f.name,
+          sizeBytes: f.size,
+          extension: ext,
+          type: fi.FileInfo.detectFileType(ext),
+        );
       }
     } catch (e, stack) {
-      debugPrint('[FluxShare] FilePickerService.pickSingleFile error: $e\n$stack');
+      debugPrint('[FluxShare] FilePickerService.pickSingleFilePayload error: $e\n$stack');
     }
     return null;
   }
 
-  static Future<List<File>> pickMultipleFiles() async {
+  static Future<File?> pickSingleFile() async {
+    final payload = await pickSingleFilePayload();
+    return payload?.file;
+  }
+
+  /// Selects multiple files and immediately returns lightweight metadata payloads
+  /// without requiring expensive synchronous disk I/O.
+  static Future<List<SelectedFilePayload>> pickMultipleFilePayloads() async {
+    if (customPayloadPickerHandler != null) {
+      final payloads = await customPayloadPickerHandler!();
+      debugPrint('[FluxShare] Picker returned: ${payloads.length} payloads');
+      return payloads;
+    }
+
     if (customMultiplePickerHandler != null) {
       final files = await customMultiplePickerHandler!();
-      debugPrint('[FluxShare] Picker returned: ${files.length} files');
-      return files;
+      debugPrint('[FluxShare] Picker returned: ${files.length} files (fallback)');
+      return files.map((f) {
+        final name = f.uri.pathSegments.isNotEmpty ? f.uri.pathSegments.last : 'file';
+        final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+        int size = 0;
+        try {
+          if (f.existsSync()) size = f.lengthSync();
+        } catch (_) {}
+        return SelectedFilePayload(
+          file: f,
+          name: name,
+          sizeBytes: size,
+          extension: ext,
+          type: fi.FileInfo.detectFileType(ext),
+        );
+      }).toList();
     }
 
     try {
@@ -64,28 +158,44 @@ class FilePickerService {
         return [];
       }
 
-      final List<File> resolvedFiles = [];
+      final List<SelectedFilePayload> payloads = [];
       for (final f in result.files) {
+        File? resolvedFile;
         if (f.path != null && f.path!.isNotEmpty) {
-          final file = File(f.path!);
-          resolvedFiles.add(file);
+          resolvedFile = File(f.path!);
         } else if (f.bytes != null) {
           final tempDir = Directory.systemTemp;
           final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-          final tempFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-          await tempFile.writeAsBytes(f.bytes!, flush: true);
-          resolvedFiles.add(tempFile);
-          debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${tempFile.path}');
+          resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
+          await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+          debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
+        }
+
+        if (resolvedFile != null) {
+          final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
+          payloads.add(SelectedFilePayload(
+            file: resolvedFile,
+            name: f.name,
+            sizeBytes: f.size,
+            extension: ext,
+            type: fi.FileInfo.detectFileType(ext),
+          ));
         } else {
           debugPrint('[FluxShare] Warning: Picked file "${f.name}" has neither path nor bytes available.');
         }
       }
 
-      debugPrint('[FluxShare] Picker returned: ${resolvedFiles.length} files');
-      return resolvedFiles;
+      debugPrint('[FluxShare] Picker returned: ${payloads.length} files');
+      return payloads;
     } catch (e, stack) {
-      debugPrint('[FluxShare] FilePickerService.pickMultipleFiles error: $e\n$stack');
+      debugPrint('[FluxShare] FilePickerService.pickMultipleFilePayloads error: $e\n$stack');
       rethrow;
     }
+  }
+
+  /// Retained for backward compatibility. Returns raw File objects.
+  static Future<List<File>> pickMultipleFiles() async {
+    final payloads = await pickMultipleFilePayloads();
+    return payloads.map((p) => p.file).toList();
   }
 }

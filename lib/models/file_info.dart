@@ -63,36 +63,60 @@ class FileInfo {
     required this.type,
   });
 
+  static String formatBytes(int length) {
+    if (length < 1024) {
+      return '$length B';
+    } else if (length < 1024 * 1024) {
+      return '${(length / 1024).toStringAsFixed(1)} KB';
+    } else if (length < 1024 * 1024 * 1024) {
+      return '${(length / (1024 * 1024)).toStringAsFixed(1)} MB';
+    } else {
+      return '${(length / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    }
+  }
+
+  static FileType detectFileType(String ext) {
+    final lower = ext.toLowerCase();
+    if (['mp4', 'mkv', 'avi', 'mov', 'webm'].contains(lower)) {
+      return FileType.Video;
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(lower)) {
+      return FileType.Image;
+    } else if (['pdf', 'doc', 'docx', 'txt', 'rtf'].contains(lower)) {
+      return FileType.Document;
+    } else if (['zip', 'rar', '7z', 'tar', 'gz'].contains(lower)) {
+      return FileType.Archive;
+    } else if (['ppt', 'pptx'].contains(lower)) {
+      return FileType.Presentation;
+    } else {
+      return FileType.Other;
+    }
+  }
+
+  factory FileInfo.fromMetadata({
+    required String path,
+    required String name,
+    required int sizeBytes,
+    String? extension,
+    FileType? type,
+  }) {
+    final ext = extension ?? (name.contains('.') ? name.split('.').last.toLowerCase() : '');
+    final resolvedType = type ?? detectFileType(ext);
+    return FileInfo(
+      id: path,
+      name: name,
+      sizeBytes: sizeBytes,
+      formattedSize: formatBytes(sizeBytes),
+      extension: ext,
+      type: resolvedType,
+    );
+  }
+
   static Future<FileInfo> fromFile(File file) async {
     final name = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
     final length = await file.length();
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
-
-    String formatted;
-    if (length < 1024) {
-      formatted = '$length B';
-    } else if (length < 1024 * 1024) {
-      formatted = '${(length / 1024).toStringAsFixed(1)} KB';
-    } else if (length < 1024 * 1024 * 1024) {
-      formatted = '${(length / (1024 * 1024)).toStringAsFixed(1)} MB';
-    } else {
-      formatted = '${(length / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-    }
-
-    FileType type;
-    if (['mp4', 'mkv', 'avi', 'mov', 'webm'].contains(ext)) {
-      type = FileType.Video;
-    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext)) {
-      type = FileType.Image;
-    } else if (['pdf', 'doc', 'docx', 'txt', 'rtf'].contains(ext)) {
-      type = FileType.Document;
-    } else if (['zip', 'rar', '7z', 'tar', 'gz'].contains(ext)) {
-      type = FileType.Archive;
-    } else if (['ppt', 'pptx'].contains(ext)) {
-      type = FileType.Presentation;
-    } else {
-      type = FileType.Other;
-    }
+    final formatted = formatBytes(length);
+    final type = detectFileType(ext);
 
     return FileInfo(
       id: file.path,
