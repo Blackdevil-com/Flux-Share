@@ -1,0 +1,129 @@
+import 'dart:async';
+import '../models/chunk.dart';
+import '../models/peer.dart';
+import '../file/chunk_manager.dart';
+import 'chunk_downloader.dart';
+import 'reservation_manager.dart';
+
+typedef OnChunkSuccess = void Function(
+  int chunkId,
+  String sourcePeerId,
+  int bytes,
+  Duration? timeToFirstByte,
+);
+typedef OnChunkFailure = void Function(
+  int chunkId,
+  String sourcePeerId,
+  String reason,
+);
+typedef SelectWorkCallback = ({ChunkMeta chunk, PeerInfo peer})? Function(String workerId);
+
+/// A parallel transfer worker that requests, streams, verifies, and commits chunks.
+/// Reuses persistent HTTP connection pooling and avoids arbitrary sleep backoffs on first failure.
+class TransferWorker {
+  final String workerId;
+  final ReservationManager reservationManager;
+  final ChunkWriterSession writerSession;
+  final ChunkDownloader downloader;
+  final SelectWorkCallback getNextWork;
+  final OnChunkSuccess onChunkSuccess;
+  final OnChunkFailure onChunkFailure;
+
+  bool _isRunning = false;
+  bool _isPaused = false;
+  Completer<void>? _workerLoopCompleter;
+
+  TransferWorker({
+    required this.workerId,
+    required this.reservationManager,
+    required this.writerSession,
+    required this.downloader,
+    required this.getNextWork,
+    required this.onChunkSuccess,
+    required this.onChunkFailure,
+  });
+
+  bool get isRunning => _isRunning;
+
+  void start() {
+    if (_isRunning) return;
+    _isRunning = true;
+    _isPaused = false;
+    _workerLoopCompleter = Completer<void>();
+    _runLoop();
+  }
+
+  void pause() {
+    _isPaused = true;
+  }
+
+  void resume() {
+    if (_isPaused) {
+      _isPaused = false;
+    }
+  }
+
+  Future<void> stop() async {
+    _isRunning = false;
+    reservationManager.releaseAll(workerId);
+    if (_workerLoopCompleter != null && !_workerLoopCompleter!.isCompleted) {
+      await _workerLoopCompleter!.future;
+    }
+  }
+
+  Future<void> _runLoop() async {
+    while (_isRunning) {
+      if (_isPaused) {
+        await Future.delayed(const Duration(milliseconds: 100));
+        continue;
+      }
+
+      final work = getNextWork(workerId);
+      if (work == null) {
+        // No work currently ready or available
+        await Future.delayed(const Duration(milliseconds: 50));
+        continue;
+      }
+
+      final chunk = work.chunk;
+      final peer = work.peer;
+
+      final reserved = reservationManager.tryReserve(chunk.chunkId, workerId);
+      if (!reserved) {
+        await Future.delayed(const Duration(milliseconds: 25));
+        continue;
+      }
+
+      final result = await downloader.downloadChunk(
+        peer: peer,
+        chunkMeta: chunk,
+        writerSession: writerSession,
+      );
+
+      // Release reservation immediately
+      reservationManager.release(chunk.chunkId);
+
+      if (!_isRunning) break;
+
+      if (result.success) {
+        onChunkSuccess(
+          chunk.chunkId,
+          peer.peerId,
+          result.bytes,
+          result.timeToFirstByte,
+        );
+      } else {
+        onChunkFailure(
+          chunk.chunkId,
+          peer.peerId,
+          result.errorMessage ?? 'Download error',
+        );
+        // Fast retry: do not delay if other peers are available
+      }
+    }
+
+    if (_workerLoopCompleter != null && !_workerLoopCompleter!.isCompleted) {
+      _workerLoopCompleter!.complete();
+    }
+  }
+}
