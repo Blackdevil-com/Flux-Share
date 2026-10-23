@@ -13,3 +13,45 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+
+# Dart and Flutter generated files
+.dart_tool/
+.packages
+.pub-cache/
+.pub/
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# Android generated build files
+android/.gradle/
+android/app/build/
+android/build/
+android/captures/
+android/local.properties
+
+# Kotlin local caches and error logs
+android/.kotlin/
+*.hprof
+
+# IDE settings
+.idea/
+.vscode/
+*.iml
+
+# Operating system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+
+# Test and coverage output
+coverage/
+
+# Temporary files
+*.tmp
+*.bak
+*.swp

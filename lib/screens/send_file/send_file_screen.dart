@@ -94,18 +94,32 @@ class _SendFileScreenState extends State<SendFileScreen> {
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
+  String _getCanonicalPath(File file) {
+    try {
+      return file.resolveSymbolicLinksSync();
+    } catch (_) {
+      return file.absolute.path;
+    }
+  }
+
   Future<void> _openFileBrowser() async {
     try {
       final pickedFiles = await FilePickerService.pickMultipleFiles();
-      if (pickedFiles.isEmpty) return;
+      if (pickedFiles.isEmpty) {
+        debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
+        return;
+      }
 
       int addedCount = 0;
       for (final file in pickedFiles) {
-        if (!await file.exists()) continue;
+        if (!await file.exists()) {
+          debugPrint('[FluxShare] Inaccessible file: ${file.path}');
+          continue;
+        }
 
         // Prevent duplicate file selection by canonical path
-        final canonicalPath = file.path;
-        if (_selectedFiles.any((item) => item.file.path == canonicalPath)) {
+        final canonicalPath = _getCanonicalPath(file);
+        if (_selectedFiles.any((item) => _getCanonicalPath(item.file) == canonicalPath)) {
           continue;
         }
 
@@ -113,6 +127,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
         _selectedFiles.add(PickedFileItem(file: file, info: info));
         addedCount++;
       }
+
+      debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
 
       if (mounted) {
         setState(() {});
@@ -142,6 +158,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
       setState(() {
         _selectedFiles.removeAt(index);
       });
+      debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
     }
   }
 
@@ -149,6 +166,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
     setState(() {
       _selectedFiles.clear();
     });
+    debugPrint('[FluxShare] Selection state contains: 0 files');
   }
 
   void _toggleDeviceSelection(String deviceId) {
@@ -179,6 +197,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   }
 
   Future<void> _startTransfer() async {
+    debugPrint('[FluxShare] Start Transfer received: ${_selectedFiles.length} files');
     if (_selectedFiles.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Please select at least one file to transfer')),
@@ -290,6 +309,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
   @override
   Widget build(BuildContext context) {
+    debugPrint('[FluxShare] UI displays: ${_selectedFiles.length} files');
     final bool canStartTransfer = _selectedFiles.isNotEmpty;
 
     return Scaffold(
