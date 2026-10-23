@@ -1,5 +1,4 @@
 import 'package:flutter/material.dart';
-import '../../ai/ai_models.dart';
 import '../../ai/ai_service.dart';
 import '../../app/theme.dart';
 import '../../models/models.dart';

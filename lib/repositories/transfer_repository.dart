@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:path_provider/path_provider.dart';
-import '../models/file_info.dart';
 import '../models/transfer.dart';
 import '../transfer/transfer_engine.dart';
 

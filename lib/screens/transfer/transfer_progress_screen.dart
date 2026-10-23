@@ -7,6 +7,7 @@ import '../../app/theme.dart';
 import '../../models/models.dart';
 import '../../network/local_server.dart';
 import '../../repositories/transfer_repository.dart';
+import '../../transfer/batch_transfer_coordinator.dart';
 import '../../transfer/transfer_engine.dart';
 import '../../widgets/widgets.dart';
 import 'transfer_complete_screen.dart';
@@ -18,6 +19,9 @@ class TransferProgressScreen extends StatefulWidget {
   final File? destinationFile;
   final File? sourceFile;
   final Manifest? manifest;
+  final BatchManifest? batchManifest;
+  final List<File>? sourceFiles;
+  final BatchTransferCoordinator? batchCoordinator;
   final bool isHost;
   final String? roomPin;
 
@@ -29,6 +33,9 @@ class TransferProgressScreen extends StatefulWidget {
     this.destinationFile,
     this.sourceFile,
     this.manifest,
+    this.batchManifest,
+    this.sourceFiles,
+    this.batchCoordinator,
     this.isHost = false,
     this.roomPin,
   });
@@ -53,6 +60,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   bool _optimizationApplied = false;
 
   StreamSubscription<TransferProgressEvent>? _engineSub;
+  StreamSubscription<BatchProgressEvent>? _batchSub;
+  BatchProgressEvent? _batchEvent;
+  BatchTransferCoordinator? _activeCoordinator;
+
   bool _isPreviewReady = false;
   final Map<String, double> _receiverProgressMap = {};
 
@@ -83,11 +94,39 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _currentDiagnosis = AIFailureDiagnosis.normal;
     }
 
-    if (widget.engine != null) {
+    if (widget.batchCoordinator != null) {
+      _activeCoordinator = widget.batchCoordinator;
+      _bindBatchCoordinator(widget.batchCoordinator!);
+    } else if (widget.engine != null) {
       _bindTransferEngine(widget.engine!);
     } else if (widget.isHost) {
       _bindHostControl();
     }
+  }
+
+  void _bindBatchCoordinator(BatchTransferCoordinator coordinator) {
+    _batchSub = coordinator.progressStream.listen((event) {
+      if (!mounted) return;
+
+      final aiService = AIService();
+      if (aiService.config.isAiEnabled) {
+        aiService.failureDetector.recordChunkSuccess(event.overallSpeedMbPerSec);
+        _currentDiagnosis = aiService.failureDetector.diagnose();
+      }
+
+      setState(() {
+        _batchEvent = event;
+        _progressPercent = event.overallProgressPercent;
+        _speedMbPerSec = event.overallSpeedMbPerSec;
+        _bytesTransferred = event.totalBytesTransferred;
+        _isPaused = event.isPaused;
+        _isCancelled = event.isCancelled;
+      });
+
+      if (event.isCompleted) {
+        _onTransferSuccess();
+      }
+    });
   }
 
   void _bindTransferEngine(TransferEngine engine) {
@@ -125,7 +164,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         _onTransferSuccess();
       } else if (event.status == TransferStatus.failed) {
         if (aiService.config.isAiEnabled) {
-          aiService.failureDetector.recordChunkFailure(event.errorMessage ?? 'Verification error');
+          aiService.failureDetector.recordChunkFailure(
+            event.errorMessage ?? 'Verification error',
+          );
           _currentDiagnosis = aiService.failureDetector.diagnose();
         }
         _showErrorDialog(event.errorMessage ?? 'Transfer verification failed.');
@@ -182,13 +223,19 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   }
 
   void _onTransferSuccess() {
+    final totalFiles = _batchEvent?.totalFiles ??
+        (widget.batchManifest?.totalFiles ?? 1);
+
     final transfer = Transfer(
-      id: widget.manifest?.fileId ?? 'transfer_${DateTime.now().millisecondsSinceEpoch}',
+      id: widget.manifest?.fileId ??
+          widget.batchManifest?.batchId ??
+          'transfer_${DateTime.now().millisecondsSinceEpoch}',
       fileInfo: _file,
-      direction: widget.isHost ? TransferDirection.sent : TransferDirection.received,
+      direction:
+          widget.isHost ? TransferDirection.sent : TransferDirection.received,
       status: TransferStatus.completed,
       progressPercent: 100.0,
-      bytesTransferred: _file.sizeBytes,
+      bytesTransferred: _bytesTransferred > 0 ? _bytesTransferred : _file.sizeBytes,
       transferSpeedMbPerSec: _speedMbPerSec,
       remainingSeconds: 0,
       timestamp: DateTime.now(),
@@ -198,25 +245,25 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
               deviceId: d.id,
               deviceName: d.name,
               progressPercent: 100.0,
-              isCompleted: true,
             ),
           )
           .toList(),
       chunkStats: {
-        'chunkCount': widget.manifest?.chunkCount ?? 0,
-        'chunkSize': widget.manifest?.chunkSize ?? 0,
+        'totalFiles': totalFiles,
+        'batchId': widget.batchManifest?.batchId,
       },
     );
 
     TransferRepository().updateTransfer(transfer);
-    _navigateToComplete();
+
+    if (mounted) {
+      _navigateToComplete();
+    }
   }
 
   void _showErrorDialog(String message) {
-    if (!mounted) return;
     showDialog(
       context: context,
-      barrierDismissible: false,
       builder: (context) => AlertDialog(
         title: const Text('Transfer Failed'),
         content: Text(message),
@@ -238,7 +285,13 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _isPaused = !_isPaused;
     });
 
-    if (widget.engine != null) {
+    if (_activeCoordinator != null) {
+      if (_isPaused) {
+        _activeCoordinator!.pause();
+      } else {
+        _activeCoordinator!.resume();
+      }
+    } else if (widget.engine != null) {
       if (_isPaused) {
         widget.engine!.pause();
       } else {
@@ -248,11 +301,14 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   }
 
   Future<void> _cancelTransfer() async {
+    if (_isCancelled) return;
     setState(() {
       _isCancelled = true;
     });
 
-    if (widget.engine != null) {
+    if (_activeCoordinator != null) {
+      await _activeCoordinator!.cancel();
+    } else if (widget.engine != null) {
       await widget.engine!.cancel();
     }
 
@@ -273,7 +329,8 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       MaterialPageRoute(
         builder: (context) => TransferCompleteScreen(
           fileInfo: _file,
-          receiversCount: _receiverDevices.isNotEmpty ? _receiverDevices.length : 1,
+          receiversCount:
+              _receiverDevices.isNotEmpty ? _receiverDevices.length : 1,
           avgSpeedText: _speedMbPerSec > 0
               ? '${_speedMbPerSec.toStringAsFixed(1)} MB/s'
               : 'Completed',
@@ -285,6 +342,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   @override
   void dispose() {
     _engineSub?.cancel();
+    _batchSub?.cancel();
     if (widget.isHost) {
       LocalServer().removeControlListener(_handleHostControlMessage);
     }
@@ -302,7 +360,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   String _formatBytes(int bytes) {
     if (bytes < 1024) return '$bytes B';
     if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
     return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 
@@ -314,15 +374,19 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final totalBytes = _file.sizeBytes > 0 ? _file.sizeBytes : 1;
+    final isBatch = (_batchEvent != null && _batchEvent!.items.length > 1) ||
+        (widget.batchManifest != null && widget.batchManifest!.manifests.length > 1);
+
+    final totalBytes = _batchEvent != null
+        ? _batchEvent!.totalBytes
+        : (widget.batchManifest?.totalBytes ?? (_file.sizeBytes > 0 ? _file.sizeBytes : 1));
+
     final currentBytes = _bytesTransferred > 0
         ? _bytesTransferred
         : ((_progressPercent / 100.0) * totalBytes).round();
 
     final transferredStr = _formatBytes(currentBytes);
-    final totalStr = _file.formattedSize.isNotEmpty
-        ? _file.formattedSize
-        : _formatBytes(totalBytes);
+    final totalStr = _formatBytes(totalBytes);
 
     final speedText = _isPaused
         ? '0 MB/s'
@@ -333,7 +397,11 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,
       appBar: AppBar(
-        title: Text(widget.isHost ? 'Distributing File...' : 'Receiving File...'),
+        title: Text(
+          widget.isHost
+              ? (isBatch ? 'Distributing Batch...' : 'Distributing File...')
+              : (isBatch ? 'Receiving Batch...' : 'Receiving File...'),
+        ),
         automaticallyImplyLeading: false,
         actions: [
           IconButton(
@@ -395,13 +463,65 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                       const SizedBox(height: AppSpacing.s16),
                     ],
 
-                    // File details card
-                    FileCard(fileInfo: _file),
-                    const SizedBox(height: AppSpacing.s24),
+                    if (!isBatch) ...[
+                      // File details card
+                      FileCard(fileInfo: _file),
+                      const SizedBox(height: AppSpacing.s24),
+                    ] else ...[
+                      // Batch Header Summary Card
+                      Container(
+                        width: double.infinity,
+                        padding: const EdgeInsets.all(AppSpacing.s16),
+                        decoration: BoxDecoration(
+                          color: AppColors.lightGray,
+                          borderRadius: AppShapes.cardBorderRadius,
+                          border: Border.all(color: AppColors.borderGray),
+                        ),
+                        child: Column(
+                          children: [
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                              children: [
+                                Text(
+                                  'BATCH TRANSFER (${_batchEvent?.totalFiles ?? widget.batchManifest?.totalFiles ?? 0} FILES)',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    letterSpacing: 1.0,
+                                    color: AppColors.mediumGray,
+                                  ),
+                                ),
+                                Text(
+                                  totalStr,
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.primaryBlack,
+                                  ),
+                                ),
+                              ],
+                            ),
+                            if (_batchEvent != null) ...[
+                              const SizedBox(height: 10),
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                                children: [
+                                  _buildBatchStatBadge('Done', _batchEvent!.completedFiles, Colors.green),
+                                  _buildBatchStatBadge('Active', _batchEvent!.activeFiles, Colors.blue),
+                                  _buildBatchStatBadge('Queued', _batchEvent!.queuedFiles, AppColors.mediumGray),
+                                  _buildBatchStatBadge('Failed', _batchEvent!.failedFiles, Colors.redAccent),
+                                ],
+                              ),
+                            ],
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: AppSpacing.s20),
+                    ],
 
                     // Main progress display (Large circular indicator)
                     Container(
-                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.s24),
+                      padding: const EdgeInsets.symmetric(vertical: AppSpacing.s16),
                       child: Stack(
                         alignment: Alignment.center,
                         children: [
@@ -441,7 +561,89 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                         ],
                       ),
                     ),
-                    const SizedBox(height: AppSpacing.s24),
+                    const SizedBox(height: AppSpacing.s20),
+
+                    // If batch items are present, show the itemized queue
+                    if (_batchEvent != null && _batchEvent!.items.isNotEmpty) ...[
+                      const SectionHeader(title: 'FILES IN BATCH'),
+                      ListView.builder(
+                        shrinkWrap: true,
+                        physics: const NeverScrollableScrollPhysics(),
+                        itemCount: _batchEvent!.items.length,
+                        itemBuilder: (context, idx) {
+                          final item = _batchEvent!.items[idx];
+                          return Container(
+                            margin: const EdgeInsets.only(bottom: 8),
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: AppColors.backgroundWhite,
+                              borderRadius: BorderRadius.circular(10),
+                              border: Border.all(color: AppColors.borderGray),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Row(
+                                  children: [
+                                    Icon(
+                                      _getStatusIcon(item.status),
+                                      size: 18,
+                                      color: _getStatusColor(item.status),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        item.fileInfo.name,
+                                        style: const TextStyle(
+                                          fontWeight: FontWeight.w600,
+                                          fontSize: 13,
+                                        ),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    Text(
+                                      '${item.progressPercent.toInt()}%',
+                                      style: TextStyle(
+                                        fontWeight: FontWeight.bold,
+                                        fontSize: 12,
+                                        color: _getStatusColor(item.status),
+                                      ),
+                                    ),
+                                    if (item.status == TransferStatus.failed &&
+                                        _activeCoordinator != null) ...[
+                                      const SizedBox(width: 8),
+                                      IconButton(
+                                        icon: const Icon(Icons.refresh_rounded, size: 18),
+                                        tooltip: 'Retry File',
+                                        onPressed: () => _activeCoordinator!.retryFile(item.fileId),
+                                      ),
+                                    ],
+                                  ],
+                                ),
+                                const SizedBox(height: 6),
+                                ClipRRect(
+                                  borderRadius: BorderRadius.circular(4),
+                                  child: LinearProgressIndicator(
+                                    value: (item.progressPercent / 100.0).clamp(0.0, 1.0),
+                                    minHeight: 6,
+                                    backgroundColor: AppColors.lightGray,
+                                    valueColor: AlwaysStoppedAnimation<Color>(_getStatusColor(item.status)),
+                                  ),
+                                ),
+                                if (item.errorMessage != null) ...[
+                                  const SizedBox(height: 4),
+                                  Text(
+                                    item.errorMessage!,
+                                    style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                                  ),
+                                ],
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+                      const SizedBox(height: AppSpacing.s16),
+                    ],
 
                     if (_isPreviewReady) ...[
                       Container(
@@ -646,6 +848,61 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         ),
       ),
     );
+  }
+
+  Widget _buildBatchStatBadge(String label, int count, Color color) {
+    return Column(
+      children: [
+        Text(
+          '$count',
+          style: TextStyle(
+            fontSize: 16,
+            fontWeight: FontWeight.bold,
+            color: color,
+          ),
+        ),
+        Text(
+          label,
+          style: const TextStyle(
+            fontSize: 11,
+            color: AppColors.mediumGray,
+            fontWeight: FontWeight.w500,
+          ),
+        ),
+      ],
+    );
+  }
+
+  IconData _getStatusIcon(TransferStatus status) {
+    switch (status) {
+      case TransferStatus.completed:
+        return Icons.check_circle_rounded;
+      case TransferStatus.transferring:
+      case TransferStatus.starting:
+        return Icons.arrow_circle_down_rounded;
+      case TransferStatus.paused:
+        return Icons.pause_circle_rounded;
+      case TransferStatus.failed:
+        return Icons.error_rounded;
+      case TransferStatus.cancelled:
+        return Icons.cancel_rounded;
+    }
+  }
+
+  Color _getStatusColor(TransferStatus status) {
+    switch (status) {
+      case TransferStatus.completed:
+        return Colors.green;
+      case TransferStatus.transferring:
+      case TransferStatus.starting:
+        return AppColors.primaryBlack;
+      case TransferStatus.paused:
+        return Colors.orangeAccent;
+      case TransferStatus.failed:
+        return Colors.redAccent;
+      case TransferStatus.cancelled:
+        return AppColors.mediumGray;
+    }
   }
 
   Widget _buildStatColumn({

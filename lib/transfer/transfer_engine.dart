@@ -156,6 +156,7 @@ class TransferEngine {
       for (int i = 0; i < workerCount; i++) {
         final worker = TransferWorker(
           workerId: 'worker_$i',
+          fileId: manifest.fileId,
           reservationManager: _reservationManager,
           writerSession: _writerSession,
           downloader: _sharedDownloader,
@@ -199,10 +200,17 @@ class TransferEngine {
       return null;
     }
 
+    // Map candidate peers to their file-specific chunk availability
+    final mappedCandidates = eligibleCandidates.map((p) {
+      final fileChunks = p.getAvailableChunksForFile(manifest.fileId);
+      if (fileChunks == p.availableChunks) return p;
+      return p.copyWith(availableChunks: fileChunks);
+    }).toList();
+
     // Use swappable scheduler to select chunk and peer
     final decision = scheduler.schedule(
       missingChunks: availableMissing,
-      candidates: eligibleCandidates,
+      candidates: mappedCandidates,
       coordinatorPeerId: coordinatorPeerId,
     );
     if (decision == null) {
@@ -210,7 +218,11 @@ class TransferEngine {
     }
 
     final targetChunkId = decision.chunkId;
-    final selectedPeer = decision.peer;
+    // Map back to the original PeerInfo instance in eligibleCandidates
+    final selectedPeer = eligibleCandidates.firstWhere(
+      (p) => p.peerId == decision.peer.peerId,
+      orElse: () => decision.peer,
+    );
 
     // Atomically reserve the chunk for this worker to prevent race conditions
     final reserved = _reservationManager.tryReserve(targetChunkId, workerId);
@@ -236,8 +248,11 @@ class TransferEngine {
     int chunkId,
     String sourcePeerId,
     int bytes,
+    Duration chunkDuration,
     Duration? timeToFirstByte,
   ) {
+    if (_status == TransferStatus.cancelled) return;
+
     _chunkStates[chunkId] = ChunkState.completed;
     _verifiedChunks.add(chunkId);
     _bytesTransferred += bytes;
@@ -245,13 +260,13 @@ class TransferEngine {
     // Transport AIMD: Additive Increase on success
     _concurrencyManager.markRequestSuccess(sourcePeerId);
 
-    // Provide feedback to active scheduler (e.g. UCB1 reward calculation)
+    // Provide feedback to active scheduler with exact chunk transfer duration
     scheduler.recordTransferResult(
       peerId: sourcePeerId,
       chunkId: chunkId,
       success: true,
       bytesTransferred: bytes,
-      duration: _transferStopwatch.elapsed,
+      duration: chunkDuration,
     );
 
     // Record research metrics
@@ -274,11 +289,11 @@ class TransferEngine {
     _checkPreviewReadiness();
 
     // Make available immediately on local server for cooperative forwarding!
-    localServer.setVerifiedChunks(_verifiedChunks);
+    localServer.markChunkAvailable(chunkId, fileId: manifest.fileId);
 
     // Broadcast CHUNK_AVAILABLE via WebSocket to swarm
     try {
-      webSocketService?.notifyChunkAvailable(chunkId);
+      webSocketService?.notifyChunkAvailable(chunkId, fileId: manifest.fileId);
     } catch (_) {}
 
     _emitProgress();
@@ -291,11 +306,19 @@ class TransferEngine {
 
   /// Handles chunk failure: Multiplicative Decrease, Cooldown, scheduler feedback, and immediate reassignment.
   void _handleChunkFailure(int chunkId, String sourcePeerId, String reason) {
-    // Return to MISSING so another worker/peer can retry immediately
-    _chunkStates[chunkId] = ChunkState.missing;
+    if (_status == TransferStatus.cancelled) return;
 
     final failures = (_chunkFailureCounts[chunkId] ?? 0) + 1;
     _chunkFailureCounts[chunkId] = failures;
+
+    if (failures >= 5) {
+      _chunkStates[chunkId] = ChunkState.failed;
+      _handleFatalError('Chunk $chunkId failed after 5 retry attempts: $reason');
+      return;
+    }
+
+    // Return to MISSING so another worker/peer can retry immediately
+    _chunkStates[chunkId] = ChunkState.missing;
 
     // Transport AIMD: Multiplicative Decrease & cooldown increment
     _concurrencyManager.markRequestFailure(sourcePeerId);
@@ -325,6 +348,7 @@ class TransferEngine {
   }
 
   /// Explicit preview readiness detector for media files.
+  /// Requires a contiguous verified prefix of at least 20% of the file chunks starting from chunk 0.
   void _checkPreviewReadiness() {
     if (_isPreviewReady) return;
 
@@ -332,8 +356,8 @@ class TransferEngine {
     final isStreamable = ['mp4', 'mkv', 'mov', 'webm', 'mp3', 'wav', 'm4a', 'pdf'].contains(ext);
     if (!isStreamable) return;
 
-    // Prerequisite: First 3 chunks (or all chunks if file has fewer) verified
-    final requiredCount = min(3, manifest.chunkCount);
+    // Prerequisite: Contiguous verified prefix of first 20% of chunks from offset 0
+    final requiredCount = max(1, (manifest.chunkCount * 0.20).ceil());
     bool allRequiredVerified = true;
     for (int i = 0; i < requiredCount; i++) {
       if (!_verifiedChunks.contains(i)) {
@@ -389,7 +413,7 @@ class TransferEngine {
     await _metricsCollector.finalizeTransfer();
 
     try {
-      webSocketService?.notifyTransferCompleted();
+      webSocketService?.notifyTransferCompleted(fileId: manifest.fileId);
     } catch (_) {}
 
     _emitProgress();
@@ -512,13 +536,13 @@ class TransferEngine {
     }
   }
 
-  void dispose() {
+  Future<void> dispose() async {
     _progressTimer?.cancel();
-    _progressController.close();
-    _writerSession.close();
+    await _progressController.close();
+    await _writerSession.close();
     _sharedDownloader.close();
     for (final worker in _workers) {
-      worker.stop();
+      await worker.stop();
     }
   }
 }

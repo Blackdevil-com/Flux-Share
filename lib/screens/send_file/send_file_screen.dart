@@ -6,6 +6,7 @@ import '../../app/theme.dart';
 import '../../discovery/discovery_service.dart';
 import '../../file/file_picker_service.dart';
 import '../../file/manifest_service.dart';
+import '../../models/batch_manifest.dart';
 import '../../models/device.dart';
 import '../../models/file_info.dart';
 import '../../models/manifest.dart';
@@ -15,6 +16,12 @@ import '../../repositories/device_repository.dart';
 import '../../room/room_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
+
+class PickedFileItem {
+  final File file;
+  final FileInfo info;
+  const PickedFileItem({required this.file, required this.info});
+}
 
 class SendFileScreen extends StatefulWidget {
   final FileInfo? initialFile;
@@ -33,8 +40,7 @@ class SendFileScreen extends StatefulWidget {
 class _SendFileScreenState extends State<SendFileScreen> {
   final DeviceRepository _deviceRepository = DeviceRepository();
   final DiscoveryService _discoveryService = DiscoveryService();
-  FileInfo? _selectedFile;
-  File? _pickedFile;
+  final List<PickedFileItem> _selectedFiles = [];
   final Set<String> _selectedDeviceIds = {};
   List<Device> _nearbyDevices = [];
   bool _isLoadingDevices = true;
@@ -45,16 +51,18 @@ class _SendFileScreenState extends State<SendFileScreen> {
   void initState() {
     super.initState();
     _generateRoomPin();
-    _selectedFile = widget.initialFile;
+    if (widget.initialFile != null) {
+      _selectedFiles.add(
+        PickedFileItem(
+          file: File(widget.initialFile!.id),
+          info: widget.initialFile!,
+        ),
+      );
+    }
     if (widget.initialDeviceId != null) {
       _selectedDeviceIds.add(widget.initialDeviceId!);
     }
     _loadDevices();
-  }
-
-  @override
-  void dispose() {
-    super.dispose();
   }
 
   void _generateRoomPin() {
@@ -73,15 +81,74 @@ class _SendFileScreenState extends State<SendFileScreen> {
     }
   }
 
+  int get _totalSelectedBytes =>
+      _selectedFiles.fold(0, (sum, item) => sum + item.info.sizeBytes);
+
+  String get _formattedTotalBytes {
+    final bytes = _totalSelectedBytes;
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
   Future<void> _openFileBrowser() async {
-    final file = await FilePickerService.pickSingleFile();
-    if (file != null && mounted) {
-      final info = await FileInfo.fromFile(file);
+    try {
+      final pickedFiles = await FilePickerService.pickMultipleFiles();
+      if (pickedFiles.isEmpty) return;
+
+      int addedCount = 0;
+      for (final file in pickedFiles) {
+        if (!await file.exists()) continue;
+
+        // Prevent duplicate file selection by canonical path
+        final canonicalPath = file.path;
+        if (_selectedFiles.any((item) => item.file.path == canonicalPath)) {
+          continue;
+        }
+
+        final info = await FileInfo.fromFile(file);
+        _selectedFiles.add(PickedFileItem(file: file, info: info));
+        addedCount++;
+      }
+
+      if (mounted) {
+        setState(() {});
+        if (addedCount == 0 && pickedFiles.isNotEmpty) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Selected files are already in the transfer list.'),
+              backgroundColor: AppColors.primaryBlack,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not access files: $e'),
+            backgroundColor: AppColors.primaryBlack,
+          ),
+        );
+      }
+    }
+  }
+
+  void _removeFileAt(int index) {
+    if (index >= 0 && index < _selectedFiles.length) {
       setState(() {
-        _pickedFile = file;
-        _selectedFile = info;
+        _selectedFiles.removeAt(index);
       });
     }
+  }
+
+  void _clearAllFiles() {
+    setState(() {
+      _selectedFiles.clear();
+    });
   }
 
   void _toggleDeviceSelection(String deviceId) {
@@ -94,39 +161,58 @@ class _SendFileScreenState extends State<SendFileScreen> {
     });
   }
 
+  IconData _getFileIcon(FileType type) {
+    switch (type) {
+      case FileType.Video:
+        return Icons.videocam_rounded;
+      case FileType.Document:
+        return Icons.description_rounded;
+      case FileType.Archive:
+        return Icons.folder_zip_rounded;
+      case FileType.Presentation:
+        return Icons.slideshow_rounded;
+      case FileType.Image:
+        return Icons.image_rounded;
+      case FileType.Other:
+        return Icons.insert_drive_file_rounded;
+    }
+  }
+
   Future<void> _startTransfer() async {
-    if (_selectedFile == null) {
+    if (_selectedFiles.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please select a file to transfer')),
+        const SnackBar(content: Text('Please select at least one file to transfer')),
       );
       return;
     }
 
-    if (_pickedFile == null) {
-      _pickedFile = File(_selectedFile!.id);
-    }
-
-    if (!await _pickedFile!.exists()) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Selected file does not exist on disk')),
-      );
-      return;
+    // Verify all selected files exist on disk
+    for (final item in _selectedFiles) {
+      if (!await item.file.exists()) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('File "${item.info.name}" not found on disk')),
+        );
+        return;
+      }
     }
 
     // Show loading dialog while hashing and chunking
     showDialog(
       context: context,
       barrierDismissible: false,
-      builder: (context) => const Center(
+      builder: (context) => Center(
         child: Card(
           child: Padding(
-            padding: EdgeInsets.all(24.0),
+            padding: const EdgeInsets.all(24.0),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                CircularProgressIndicator(),
-                SizedBox(height: 16),
-                Text('Hashing file & preparing manifest...'),
+                const CircularProgressIndicator(color: AppColors.primaryBlack),
+                const SizedBox(height: 16),
+                Text(
+                  'Hashing ${_selectedFiles.length} ${_selectedFiles.length == 1 ? 'file' : 'files'} & preparing manifests...',
+                  style: const TextStyle(fontWeight: FontWeight.w600),
+                ),
               ],
             ),
           ),
@@ -135,17 +221,29 @@ class _SendFileScreenState extends State<SendFileScreen> {
     );
 
     try {
-      final manifest = await ManifestService.createManifest(_pickedFile!);
+      final List<Manifest> manifests = [];
+      final List<({Manifest manifest, File file})> batchItems = [];
 
-      // Start local server
+      for (final item in _selectedFiles) {
+        final m = await ManifestService.createManifest(item.file);
+        manifests.add(m);
+        batchItems.add((manifest: m, file: item.file));
+      }
+
+      final batchManifest = BatchManifest(
+        batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
+        manifests: manifests,
+      );
+
+      // Start local server and register all batch manifests
       final server = LocalServer();
       final port = await server.start();
-      server.setManifest(manifest, _pickedFile!);
+      server.setBatchManifests(batchItems);
 
       // Start UDP room discovery host
       await _discoveryService.startRoomHost(
         pin: _roomPin,
-        roomId: manifest.fileId,
+        roomId: batchManifest.batchId,
         serverPort: port,
         deviceName: server.localDeviceName,
       );
@@ -155,10 +253,11 @@ class _SendFileScreenState extends State<SendFileScreen> {
         hostPeerId: server.localPeerId,
         hostDeviceName: server.localDeviceName,
         customPin: _roomPin,
-        manifest: manifest,
+        manifest: manifests.first,
+        batchManifest: batchManifest,
       );
 
-      List<Device> selectedDevices = _nearbyDevices
+      final selectedDevices = _nearbyDevices
           .where((d) => _selectedDeviceIds.contains(d.id))
           .toList();
 
@@ -167,9 +266,11 @@ class _SendFileScreenState extends State<SendFileScreen> {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
             builder: (context) => TransferProgressScreen(
-              fileInfo: _selectedFile,
-              sourceFile: _pickedFile,
-              manifest: manifest,
+              batchManifest: batchManifest,
+              sourceFiles: _selectedFiles.map((i) => i.file).toList(),
+              fileInfo: _selectedFiles.first.info,
+              sourceFile: _selectedFiles.first.file,
+              manifest: manifests.first,
               isHost: true,
               roomPin: _roomPin,
               receivers: selectedDevices,
@@ -189,12 +290,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
   @override
   Widget build(BuildContext context) {
-    final bool canStartTransfer = _selectedFile != null;
+    final bool canStartTransfer = _selectedFiles.isNotEmpty;
 
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,
       appBar: AppBar(
-        title: const Text('Send File'),
+        title: const Text('Send Files'),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_rounded),
           onPressed: () => Navigator.of(context).pop(),
@@ -277,26 +378,132 @@ class _SendFileScreenState extends State<SendFileScreen> {
                   ),
                   const SizedBox(height: AppSpacing.s20),
                   const SectionHeader(title: 'File Selection'),
-                  if (_selectedFile == null)
+                  if (_selectedFiles.isEmpty)
                     FilePickerCard(
                       onTap: _openFileBrowser,
-                      title: 'Tap to select a file',
-                      subtitle: 'Browse your storage',
+                      title: 'Tap to select files',
+                      subtitle: 'Select multiple files or documents',
                     )
-                  else
-                    FileCard(
-                      fileInfo: _selectedFile!,
-                      onRemove: () {
-                        setState(() {
-                          _selectedFile = null;
-                        });
+                  else ...[
+                    // Selection summary bar
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                      decoration: BoxDecoration(
+                        color: AppColors.lightGray,
+                        borderRadius: BorderRadius.circular(10),
+                        border: Border.all(color: AppColors.borderGray),
+                      ),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Expanded(
+                            child: Text(
+                              '${_selectedFiles.length} ${_selectedFiles.length == 1 ? 'file' : 'files'} selected ($_formattedTotalBytes)',
+                              style: const TextStyle(
+                                fontWeight: FontWeight.bold,
+                                fontSize: 13,
+                                color: AppColors.primaryBlack,
+                              ),
+                            ),
+                          ),
+                          Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              TextButton.icon(
+                                onPressed: _openFileBrowser,
+                                icon: const Icon(Icons.add_rounded, size: 18),
+                                label: const Text('Add More'),
+                                style: TextButton.styleFrom(
+                                  foregroundColor: AppColors.primaryBlack,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                ),
+                              ),
+                              TextButton(
+                                onPressed: _clearAllFiles,
+                                style: TextButton.styleFrom(
+                                  foregroundColor: Colors.redAccent,
+                                  padding: const EdgeInsets.symmetric(horizontal: 8),
+                                ),
+                                child: const Text('Clear All'),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    // Selected Files List
+                    ListView.builder(
+                      shrinkWrap: true,
+                      physics: const NeverScrollableScrollPhysics(),
+                      itemCount: _selectedFiles.length,
+                      itemBuilder: (context, index) {
+                        final item = _selectedFiles[index];
+                        return Container(
+                          margin: const EdgeInsets.only(bottom: 8),
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                          decoration: BoxDecoration(
+                            color: AppColors.backgroundWhite,
+                            borderRadius: BorderRadius.circular(12),
+                            border: Border.all(color: AppColors.borderGray),
+                          ),
+                          child: Row(
+                            children: [
+                              Container(
+                                width: 38,
+                                height: 38,
+                                decoration: BoxDecoration(
+                                  color: AppColors.lightGray,
+                                  borderRadius: BorderRadius.circular(8),
+                                ),
+                                child: Icon(
+                                  _getFileIcon(item.info.type),
+                                  size: 20,
+                                  color: AppColors.primaryBlack,
+                                ),
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Column(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      item.info.name,
+                                      maxLines: 1,
+                                      overflow: TextOverflow.ellipsis,
+                                      style: const TextStyle(
+                                        fontWeight: FontWeight.w600,
+                                        fontSize: 13,
+                                        color: AppColors.primaryBlack,
+                                      ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      '${item.info.formattedSize} • ${item.info.type.displayName}',
+                                      style: const TextStyle(
+                                        fontSize: 11,
+                                        color: AppColors.mediumGray,
+                                      ),
+                                    ),
+                                  ],
+                                ),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.close_rounded, size: 18),
+                                tooltip: 'Remove file',
+                                onPressed: () => _removeFileAt(index),
+                              ),
+                            ],
+                          ),
+                        );
                       },
                     ),
+                  ],
                   const SizedBox(height: AppSpacing.s24),
                   Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
-                      SectionHeader(
+                      const SectionHeader(
                         title: 'Select Receivers',
                         padding: EdgeInsets.zero,
                       ),
@@ -382,7 +589,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
             ),
             child: SafeArea(
               child: PrimaryButton(
-                text: 'START TRANSFER',
+                text: _selectedFiles.length > 1
+                    ? 'START BATCH TRANSFER (${_selectedFiles.length})'
+                    : 'START TRANSFER',
                 icon: Icons.send_rounded,
                 onPressed: canStartTransfer ? _startTransfer : null,
               ),

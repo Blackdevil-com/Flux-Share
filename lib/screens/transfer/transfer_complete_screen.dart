@@ -35,7 +35,6 @@ class _TransferCompleteScreenState extends State<TransferCompleteScreen> {
   final AIService _aiService = AIService();
   AIClassificationResult? _classification;
   AISmartSummary? _smartSummary;
-  bool _isLoadingAi = true;
 
   @override
   void initState() {
@@ -67,13 +66,6 @@ class _TransferCompleteScreenState extends State<TransferCompleteScreen> {
         setState(() {
           _classification = classification;
           _smartSummary = summary;
-          _isLoadingAi = false;
-        });
-      }
-    } else {
-      if (mounted) {
-        setState(() {
-          _isLoadingAi = false;
         });
       }
     }

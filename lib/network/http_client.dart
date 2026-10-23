@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
+import '../models/batch_manifest.dart';
 import '../models/chunk.dart';
 import '../models/manifest.dart';
 
@@ -25,6 +26,20 @@ class ManifestFetchError extends ManifestFetchResult {
   final String message;
   final String url;
   ManifestFetchError({required this.statusCode, required this.message, required this.url});
+}
+
+sealed class BatchManifestFetchResult {}
+
+class BatchManifestFetchSuccess extends BatchManifestFetchResult {
+  final BatchManifest batchManifest;
+  BatchManifestFetchSuccess(this.batchManifest);
+}
+
+class BatchManifestFetchError extends BatchManifestFetchResult {
+  final int statusCode;
+  final String message;
+  final String url;
+  BatchManifestFetchError({required this.statusCode, required this.message, required this.url});
 }
 
 /// HTTP Client for manifest and chunk downloads.
@@ -76,6 +91,50 @@ class P2PHttpClient {
 
     return lastResult ??
         ManifestFetchError(statusCode: 0, message: 'Failed to download manifest', url: url);
+  }
+
+  /// Downloads batch manifest containing multiple files from peer with fallback to single manifest.
+  Future<BatchManifestFetchResult> downloadBatchManifest(
+    String peerIp,
+    int peerPort, {
+    int maxRetries = 3,
+    Duration retryDelay = const Duration(milliseconds: 600),
+  }) async {
+    final batchUrl = 'http://$peerIp:$peerPort/manifests';
+    for (int attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        final request = await _client.getUrl(Uri.parse(batchUrl));
+        final response = await request.close();
+
+        if (response.statusCode == HttpStatus.ok) {
+          final body = await response.transform(utf8.decoder).join();
+          final jsonMap = jsonDecode(body) as Map<String, dynamic>;
+          return BatchManifestFetchSuccess(BatchManifest.fromJson(jsonMap));
+        }
+      } catch (_) {}
+
+      if (attempt < maxRetries) {
+        await Future.delayed(retryDelay);
+      }
+    }
+
+    // Fallback to single manifest for legacy single-file hosts
+    final singleResult = await downloadManifest(peerIp, peerPort, maxRetries: 2);
+    if (singleResult is ManifestFetchSuccess) {
+      return BatchManifestFetchSuccess(BatchManifest.fromSingleManifest(singleResult.manifest));
+    } else if (singleResult is ManifestFetchError) {
+      return BatchManifestFetchError(
+        statusCode: singleResult.statusCode,
+        message: singleResult.message,
+        url: singleResult.url,
+      );
+    }
+
+    return BatchManifestFetchError(
+      statusCode: 0,
+      message: 'Failed to download batch manifest',
+      url: batchUrl,
+    );
   }
 
   /// Downloads a chunk streaming bytes directly to [destFile] with incremental SHA-256 verification.
