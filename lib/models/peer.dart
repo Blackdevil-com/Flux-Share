@@ -28,6 +28,32 @@ class PeerInfo {
     this.connectionStatus = 'available',
   }) : availableChunks = availableChunks ?? <int>{};
 
+  void touch() {
+    lastSeenMillis = DateTime.now().millisecondsSinceEpoch;
+    if (connectionStatus == 'stale' || connectionStatus == 'disconnected') {
+      connectionStatus = 'available';
+    }
+  }
+
+  void updateThroughput(double speedMbPerSec) {
+    if (speedMbPerSec <= 0) return;
+    if (emaThroughput <= 0.0) {
+      emaThroughput = speedMbPerSec;
+    } else {
+      emaThroughput = (0.3 * speedMbPerSec) + (0.7 * emaThroughput);
+    }
+  }
+
+  void recordSuccess() {
+    touch();
+    successRate = (successRate * 0.9) + 0.1;
+  }
+
+  void recordFailure() {
+    touch();
+    successRate = (successRate * 0.8);
+  }
+
   Map<String, dynamic> toJson() => {
         'peerId': peerId,
         'deviceName': deviceName,

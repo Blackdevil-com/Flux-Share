@@ -1,5 +1,8 @@
+import 'dart:io';
 import 'package:flutter/material.dart';
 import '../../app/theme.dart';
+import '../../metrics/metrics_collector.dart';
+import '../../metrics/metrics_models.dart';
 import '../../mock/mock_data.dart';
 import '../../models/models.dart';
 import '../../widgets/widgets.dart';
@@ -21,6 +24,7 @@ class TransferDetailsScreen extends StatelessWidget {
   final String durationText;
   final String avgSpeedText;
   final int receiversCount;
+  final TransferMetrics? metrics;
 
   const TransferDetailsScreen({
     super.key,
@@ -28,34 +32,50 @@ class TransferDetailsScreen extends StatelessWidget {
     this.durationText = '01:52',
     this.avgSpeedText = '42 MB/s',
     this.receiversCount = 3,
+    this.metrics,
   });
 
   @override
   Widget build(BuildContext context) {
-    final file = fileInfo ?? MockData.mockFiles[0]; // Project_Video.mp4, 4.8 GB
+    final collector = MetricsCollector();
+    final effectiveMetrics = metrics ??
+        (collector.getHistory().isNotEmpty ? collector.getHistory().last : null);
 
-    final receiverDetails = [
-      const ReceiverDetailItem(
-        name: "Akash's iPhone",
-        platform: DevicePlatform.iPhone,
-        throughput: '78 MB/s',
-      ),
-      const ReceiverDetailItem(
-        name: "Rohan's Android",
-        platform: DevicePlatform.Android,
-        throughput: '52 MB/s',
-      ),
-      const ReceiverDetailItem(
-        name: "Dev's Tablet",
-        platform: DevicePlatform.Android,
-        throughput: '41 MB/s',
-      ),
-    ];
+    final file = fileInfo ??
+        (effectiveMetrics != null
+            ? FileInfo(
+                id: effectiveMetrics.fileId,
+                name: effectiveMetrics.fileName,
+                sizeBytes: effectiveMetrics.fileSize,
+                formattedSize: _formatBytes(effectiveMetrics.fileSize),
+                extension: effectiveMetrics.fileName.contains('.')
+                    ? effectiveMetrics.fileName.split('.').last
+                    : '',
+                type: FileType.Other,
+              )
+            : MockData.mockFiles[0]);
+
+    final duration = effectiveMetrics != null
+        ? '${(effectiveMetrics.totalDistributionTimeMillis / 1000).toStringAsFixed(1)}s'
+        : durationText;
+    final speed = effectiveMetrics != null
+        ? '${effectiveMetrics.aggregateThroughputMbps.toStringAsFixed(1)} Mbps'
+        : avgSpeedText;
+    final scheduler = effectiveMetrics?.schedulerMode.toUpperCase() ?? 'ROUND-ROBIN';
+    final networkMode = effectiveMetrics?.networkMode.toUpperCase() ?? 'WIFI';
+    final chunks = effectiveMetrics?.chunkCount.toString() ?? '4,608';
+    final retries = effectiveMetrics?.retransmissionCount.toString() ?? '0';
+    final ttfb = effectiveMetrics != null && effectiveMetrics.avgTimeToFirstByteMillis > 0
+        ? '${effectiveMetrics.avgTimeToFirstByteMillis.toStringAsFixed(0)} ms'
+        : 'N/A';
+    final preview = effectiveMetrics?.timeToFirstPreviewReadyMillis != null
+        ? '${effectiveMetrics!.timeToFirstPreviewReadyMillis} ms'
+        : 'N/A';
 
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,
       appBar: AppBar(
-        title: const Text('Transfer Details'),
+        title: const Text('Transfer Details & Report'),
         leading: IconButton(
           icon: const Icon(Icons.arrow_back_rounded),
           onPressed: () => Navigator.of(context).pop(),
@@ -72,7 +92,7 @@ class TransferDetailsScreen extends StatelessWidget {
               const SizedBox(height: AppSpacing.s24),
 
               // Transfer statistics table/grid
-              const SectionHeader(title: 'Transfer Statistics'),
+              const SectionHeader(title: 'Transfer & Transport Statistics'),
               Container(
                 decoration: BoxDecoration(
                   color: AppColors.backgroundWhite,
@@ -81,106 +101,136 @@ class TransferDetailsScreen extends StatelessWidget {
                 ),
                 child: Column(
                   children: [
-                    _buildStatRow('File size', file.formattedSize),
+                    _buildStatRow('File Size', file.formattedSize),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Duration', durationText),
+                    _buildStatRow('Duration', duration),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Average speed', avgSpeedText),
+                    _buildStatRow('Aggregate Speed', speed),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Receivers', '$receiversCount'),
+                    _buildStatRow('Scheduler Mode', scheduler),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Total Chunks', '4,608'),
+                    _buildStatRow('Network Mode', networkMode),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Successful Chunks', '4,608'),
+                    _buildStatRow('Total Chunks', chunks),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Failed Chunks', '0'),
+                    _buildStatRow('Retransmissions / Retries', retries),
                     const Divider(height: 1, color: AppColors.borderGray),
-                    _buildStatRow('Retries', '0'),
+                    _buildStatRow('Avg Time to First Byte (TTFB)', ttfb),
+                    const Divider(height: 1, color: AppColors.borderGray),
+                    _buildStatRow('Time to Preview Ready', preview),
+                    if (effectiveMetrics != null) ...[
+                      const Divider(height: 1, color: AppColors.borderGray),
+                      _buildStatRow(
+                        'Sender Upload Volume',
+                        _formatBytes(effectiveMetrics.senderUploadVolumeBytes),
+                      ),
+                      const Divider(height: 1, color: AppColors.borderGray),
+                      _buildStatRow(
+                        'Cooperative Forward Volume',
+                        _formatBytes(effectiveMetrics.cooperativeForwardingVolumeBytes),
+                      ),
+                    ],
                   ],
                 ),
               ),
               const SizedBox(height: AppSpacing.s24),
 
-              // Receiver Details list
-              const SectionHeader(title: 'Receiver Details'),
-              Column(
-                children: receiverDetails.map((receiver) {
-                  return Container(
-                    margin: const EdgeInsets.only(bottom: AppSpacing.s12),
-                    padding: const EdgeInsets.all(AppSpacing.s16),
-                    decoration: BoxDecoration(
-                      color: AppColors.backgroundWhite,
-                      borderRadius: AppShapes.cardBorderRadius,
-                      border: Border.all(color: AppColors.borderGray),
-                    ),
-                    child: Row(
-                      children: [
-                        Container(
-                          width: 40,
-                          height: 40,
-                          decoration: BoxDecoration(
-                            color: AppColors.lightGray,
-                            borderRadius: BorderRadius.circular(10.0),
-                            border: Border.all(color: AppColors.borderGray),
-                          ),
-                          child: Icon(
-                            receiver.platform == DevicePlatform.iPhone
-                                ? Icons.phone_iphone_rounded
-                                : Icons.phone_android_rounded,
-                            color: AppColors.primaryBlack,
-                            size: 20,
-                          ),
+              // Export CSV Button (Phase D3)
+              PrimaryButton(
+                text: 'EXPORT EVALUATION REPORT (CSV)',
+                icon: Icons.file_download_outlined,
+                onPressed: () async {
+                  try {
+                    final file = await collector.exportMetricsCsvFile();
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(
+                          content: Text('Metrics exported: ${file.path}'),
+                          backgroundColor: AppColors.primaryBlack,
                         ),
-                        const SizedBox(width: AppSpacing.s12),
-                        Expanded(
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.start,
-                            children: [
-                              Text(
-                                receiver.name,
-                                style: const TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.bold,
-                                  color: AppColors.primaryBlack,
-                                ),
-                              ),
-                              const SizedBox(height: 2),
-                              Text(
-                                receiver.platform.displayName,
-                                style: const TextStyle(
-                                  fontSize: 13,
-                                  color: AppColors.mediumGray,
-                                ),
-                              ),
-                            ],
-                          ),
-                        ),
-                        Column(
-                          crossAxisAlignment: CrossAxisAlignment.end,
-                          children: [
-                            Text(
-                              receiver.throughput,
-                              style: const TextStyle(
-                                fontSize: 15,
-                                fontWeight: FontWeight.bold,
-                                color: AppColors.primaryBlack,
-                              ),
-                            ),
-                            const SizedBox(height: 2),
-                            const Text(
-                              'Throughput',
-                              style: TextStyle(
-                                fontSize: 11,
-                                color: AppColors.mediumGray,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ],
-                    ),
-                  );
-                }).toList(),
+                      );
+                    }
+                  } catch (e) {
+                    if (context.mounted) {
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        SnackBar(content: Text('Export failed: $e')),
+                      );
+                    }
+                  }
+                },
               ),
+              const SizedBox(height: AppSpacing.s24),
+
+              // Peer breakdown
+              if (effectiveMetrics != null && effectiveMetrics.peerUtilizations.isNotEmpty) ...[
+                const SectionHeader(title: 'Per-Peer Utilization Breakdown'),
+                Column(
+                  children: effectiveMetrics.peerUtilizations.values.map((util) {
+                    final uploaded = _formatBytes(util.bytesUploaded);
+                    final received = _formatBytes(util.bytesReceived);
+                    final pct = (util.utilizationFraction * 100).toInt();
+
+                    return Container(
+                      margin: const EdgeInsets.only(bottom: AppSpacing.s12),
+                      padding: const EdgeInsets.all(AppSpacing.s16),
+                      decoration: BoxDecoration(
+                        color: AppColors.backgroundWhite,
+                        borderRadius: AppShapes.cardBorderRadius,
+                        border: Border.all(color: AppColors.borderGray),
+                      ),
+                      child: Row(
+                        children: [
+                          Container(
+                            width: 36,
+                            height: 36,
+                            decoration: const BoxDecoration(
+                              color: AppColors.primaryBlack,
+                              shape: BoxShape.circle,
+                            ),
+                            child: const Icon(
+                              Icons.devices_rounded,
+                              color: AppColors.backgroundWhite,
+                              size: 18,
+                            ),
+                          ),
+                          const SizedBox(width: AppSpacing.s12),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  util.peerId,
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: AppColors.primaryBlack,
+                                  ),
+                                ),
+                                const SizedBox(height: 2),
+                                Text(
+                                  'Role: ${util.role} • Up: $uploaded • Down: $received',
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    color: AppColors.mediumGray,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                          Text(
+                            '$pct% Util',
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.bold,
+                              color: AppColors.primaryBlack,
+                            ),
+                          ),
+                        ],
+                      ),
+                    );
+                  }).toList(),
+                ),
+              ],
             ],
           ),
         ),
@@ -215,5 +265,12 @@ class TransferDetailsScreen extends StatelessWidget {
         ],
       ),
     );
+  }
+
+  static String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
   }
 }

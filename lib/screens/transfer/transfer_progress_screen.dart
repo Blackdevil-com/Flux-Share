@@ -53,6 +53,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   bool _optimizationApplied = false;
 
   StreamSubscription<TransferProgressEvent>? _engineSub;
+  bool _isPreviewReady = false;
   final Map<String, double> _receiverProgressMap = {};
 
   @override
@@ -115,6 +116,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         _bytesTransferred = event.bytesTransferred;
         _remainingSeconds = event.remainingSeconds;
         _isPaused = event.status == TransferStatus.paused;
+        if (event.isPreviewReady) {
+          _isPreviewReady = true;
+        }
       });
 
       if (event.status == TransferStatus.completed) {
@@ -439,6 +443,40 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                     ),
                     const SizedBox(height: AppSpacing.s24),
 
+                    if (_isPreviewReady) ...[
+                      Container(
+                        margin: const EdgeInsets.only(bottom: AppSpacing.s16),
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: AppSpacing.s16,
+                          vertical: AppSpacing.s10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: AppColors.primaryBlack,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.play_circle_outline_rounded,
+                              color: AppColors.backgroundWhite,
+                              size: 18,
+                            ),
+                            SizedBox(width: AppSpacing.s8),
+                            Text(
+                              'PREVIEW READY (First 20% Available)',
+                              style: TextStyle(
+                                color: AppColors.backgroundWhite,
+                                fontWeight: FontWeight.bold,
+                                fontSize: 12,
+                                letterSpacing: 0.5,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
+
                     // Real-time statistics grid/row
                     Container(
                       padding: const EdgeInsets.all(AppSpacing.s16),
@@ -559,6 +597,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                           );
                         }),
                       ),
+                    ],
+                    if (widget.engine != null) ...[
+                      const SizedBox(height: AppSpacing.s16),
+                      LiveSwarmVisualization(engine: widget.engine!),
                     ],
                   ],
                 ),

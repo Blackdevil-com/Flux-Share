@@ -217,9 +217,11 @@ class _HomeScreenState extends State<HomeScreen> {
           },
         ),
         if (_isLoadingDevices)
-          const Center(
+          const Padding(
             padding: EdgeInsets.all(AppSpacing.s16),
-            child: CircularProgressIndicator(color: AppColors.primaryBlack),
+            child: Center(
+              child: CircularProgressIndicator(color: AppColors.primaryBlack),
+            ),
           )
         else if (displayDevices.isEmpty)
           Container(
@@ -296,9 +298,11 @@ class _HomeScreenState extends State<HomeScreen> {
           },
         ),
         if (_isLoadingTransfers)
-          const Center(
+          const Padding(
             padding: EdgeInsets.all(AppSpacing.s16),
-            child: CircularProgressIndicator(color: AppColors.primaryBlack),
+            child: Center(
+              child: CircularProgressIndicator(color: AppColors.primaryBlack),
+            ),
           )
         else if (_recentTransfers.isEmpty)
           Container(

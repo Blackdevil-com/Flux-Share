@@ -74,7 +74,8 @@ class TransferMetrics {
   final int fileSize;
   final int chunkCount;
   final int chunkSize;
-  final String schedulerMode; // "round-robin", "adaptive", "baseline-sender-only"
+  final String schedulerMode; // "round-robin", "sequential-priority", "ucb1-adaptive"
+  final String networkMode; // "wifi", "hotspot"
   final int receiverCount;
 
   final int startTimeMillis;
@@ -95,6 +96,7 @@ class TransferMetrics {
   final List<RetryEvent> retryEvents;
   final Map<int, int> timeToFirstByteMillis;
   final double avgTimeToFirstByteMillis;
+  final int? timeToFirstPreviewReadyMillis;
 
   const TransferMetrics({
     required this.transferId,
@@ -104,6 +106,7 @@ class TransferMetrics {
     required this.chunkCount,
     required this.chunkSize,
     required this.schedulerMode,
+    this.networkMode = 'wifi',
     required this.receiverCount,
     required this.startTimeMillis,
     required this.endTimeMillis,
@@ -119,6 +122,7 @@ class TransferMetrics {
     this.retryEvents = const [],
     this.timeToFirstByteMillis = const {},
     this.avgTimeToFirstByteMillis = 0.0,
+    this.timeToFirstPreviewReadyMillis,
   });
 
   Map<String, dynamic> toJson() => {
@@ -129,6 +133,7 @@ class TransferMetrics {
     'chunkCount': chunkCount,
     'chunkSize': chunkSize,
     'schedulerMode': schedulerMode,
+    'networkMode': networkMode,
     'receiverCount': receiverCount,
     'startTimeMillis': startTimeMillis,
     'endTimeMillis': endTimeMillis,
@@ -144,6 +149,7 @@ class TransferMetrics {
     'retryEvents': retryEvents.map((r) => r.toJson()).toList(),
     'timeToFirstByteMillis': timeToFirstByteMillis.map((k, v) => MapEntry(k.toString(), v)),
     'avgTimeToFirstByteMillis': avgTimeToFirstByteMillis,
+    'timeToFirstPreviewReadyMillis': timeToFirstPreviewReadyMillis,
   };
 
   factory TransferMetrics.fromJson(Map<String, dynamic> json) => TransferMetrics(
@@ -154,6 +160,7 @@ class TransferMetrics {
     chunkCount: json['chunkCount'] ?? 0,
     chunkSize: json['chunkSize'] ?? 0,
     schedulerMode: json['schedulerMode'] ?? 'round-robin',
+    networkMode: json['networkMode'] ?? 'wifi',
     receiverCount: json['receiverCount'] ?? 0,
     startTimeMillis: json['startTimeMillis'] ?? 0,
     endTimeMillis: json['endTimeMillis'] ?? 0,
@@ -181,5 +188,6 @@ class TransferMetrics {
         ) ??
         {},
     avgTimeToFirstByteMillis: (json['avgTimeToFirstByteMillis'] as num?)?.toDouble() ?? 0.0,
+    timeToFirstPreviewReadyMillis: json['timeToFirstPreviewReadyMillis'] as int?,
   );
 }

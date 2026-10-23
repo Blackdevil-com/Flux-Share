@@ -1,5 +1,3 @@
-import 'dart:async';
-
 /// Manages chunk download reservations to prevent multiple workers
 /// from redundantly fetching the same chunk concurrently.
 class ReservationManager {
@@ -19,6 +17,15 @@ class ReservationManager {
     _reservations[chunkId] = workerId;
     _reservationTimestamps[chunkId] = DateTime.now();
     return true;
+  }
+
+  /// Renews an active reservation for an ongoing download so it does not expire.
+  bool renew(int chunkId, String workerId) {
+    if (_reservations[chunkId] == workerId) {
+      _reservationTimestamps[chunkId] = DateTime.now();
+      return true;
+    }
+    return false;
   }
 
   /// Releases reservation for the given chunk.

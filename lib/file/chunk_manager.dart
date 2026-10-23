@@ -65,7 +65,7 @@ class ChunkWriterSession {
 
     // Chain onto the write queue to ensure serialized file-pointer seeks
     final completer = Completer<void>();
-    _writeQueue = _writeQueue.then((_) async {
+    _writeQueue = _writeQueue.catchError((_) {}).then((_) async {
       try {
         if (_raf != null && _isOpen) {
           await _raf!.setPosition(offset);
@@ -82,12 +82,17 @@ class ChunkWriterSession {
   }
 
   /// Flushes and closes the file handle.
-  Future<void> close() async {
+  Future<void> close({bool truncateToExactSize = true}) async {
     if (!_isOpen) return;
     _isOpen = false;
-    await _writeQueue; // Wait for any pending write to finish
+    try {
+      await _writeQueue; // Wait for any pending write to finish
+    } catch (_) {}
     if (_raf != null) {
       try {
+        if (truncateToExactSize) {
+          await _raf!.truncate(totalSize);
+        }
         await _raf!.flush();
         await _raf!.close();
       } catch (_) {}

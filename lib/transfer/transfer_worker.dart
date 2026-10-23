@@ -19,7 +19,8 @@ typedef OnChunkFailure = void Function(
 typedef SelectWorkCallback = ({ChunkMeta chunk, PeerInfo peer})? Function(String workerId);
 
 /// A parallel transfer worker that requests, streams, verifies, and commits chunks.
-/// Reuses persistent HTTP connection pooling and avoids arbitrary sleep backoffs on first failure.
+/// Reuses persistent HTTP connection pooling, safely renews active reservations,
+/// and guarantees release of chunk reservations on every terminal path.
 class TransferWorker {
   final String workerId;
   final ReservationManager reservationManager;
@@ -81,27 +82,43 @@ class TransferWorker {
       final work = getNextWork(workerId);
       if (work == null) {
         // No work currently ready or available
-        await Future.delayed(const Duration(milliseconds: 50));
+        await Future.delayed(const Duration(milliseconds: 40));
         continue;
       }
 
       final chunk = work.chunk;
       final peer = work.peer;
 
-      final reserved = reservationManager.tryReserve(chunk.chunkId, workerId);
-      if (!reserved) {
-        await Future.delayed(const Duration(milliseconds: 25));
-        continue;
+      // Start periodic reservation renewal timer to prevent expiry during long-running downloads
+      Timer? renewalTimer;
+      renewalTimer = Timer.periodic(const Duration(seconds: 5), (_) {
+        if (!_isRunning || _isPaused) {
+          renewalTimer?.cancel();
+          return;
+        }
+        reservationManager.renew(chunk.chunkId, workerId);
+      });
+
+      ChunkDownloadResult? result;
+      try {
+        result = await downloader.downloadChunk(
+          peer: peer,
+          chunkMeta: chunk,
+          writerSession: writerSession,
+        );
+      } catch (e) {
+        result = ChunkDownloadResult(
+          chunkId: chunk.chunkId,
+          success: false,
+          peerId: peer.peerId,
+          bytes: 0,
+          duration: Duration.zero,
+          errorMessage: e.toString(),
+        );
+      } finally {
+        renewalTimer.cancel();
+        reservationManager.release(chunk.chunkId);
       }
-
-      final result = await downloader.downloadChunk(
-        peer: peer,
-        chunkMeta: chunk,
-        writerSession: writerSession,
-      );
-
-      // Release reservation immediately
-      reservationManager.release(chunk.chunkId);
 
       if (!_isRunning) break;
 
@@ -118,7 +135,6 @@ class TransferWorker {
           peer.peerId,
           result.errorMessage ?? 'Download error',
         );
-        // Fast retry: do not delay if other peers are available
       }
     }
 

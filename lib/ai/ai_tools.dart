@@ -3,7 +3,6 @@ import 'package:path_provider/path_provider.dart';
 import '../metrics/metrics_collector.dart';
 import '../models/models.dart';
 import '../network/local_server.dart';
-import '../peer/peer_manager.dart';
 import '../repositories/device_repository.dart';
 import '../repositories/transfer_repository.dart';
 

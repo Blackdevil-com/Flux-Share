@@ -33,7 +33,7 @@ void main() {
           remainingSeconds: 0,
           timestamp: now,
           receivers: [
-            const ReceiverProgress(peerId: 'p1', deviceName: "Akash's phone", percent: 100)
+            const ReceiverProgress(peerId: 'p1', deviceName: "Akash's phone", progressPercent: 100)
           ],
           chunkStats: {},
         ),
@@ -55,7 +55,7 @@ void main() {
           remainingSeconds: 0,
           timestamp: now.subtract(const Duration(days: 3)),
           receivers: [
-            const ReceiverProgress(peerId: 'p2', deviceName: "Sara's iPhone", percent: 100)
+            const ReceiverProgress(peerId: 'p2', deviceName: "Sara's iPhone", progressPercent: 100)
           ],
           chunkStats: {},
         ),
@@ -77,7 +77,7 @@ void main() {
           remainingSeconds: 0,
           timestamp: now,
           receivers: [
-            const ReceiverProgress(peerId: 'p1', deviceName: "Akash's phone", percent: 100)
+            const ReceiverProgress(peerId: 'p1', deviceName: "Akash's phone", progressPercent: 100)
           ],
           chunkStats: {},
         ),

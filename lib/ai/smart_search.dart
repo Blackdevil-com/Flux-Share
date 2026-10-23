@@ -65,10 +65,19 @@ class SmartFileSearch {
     }
 
     // 4. Detect Peer / Sender Constraint
-    final fromRegex = RegExp(r'(?:from|received from)\s+([a-zA-Z0-9_\-\'\s]+?)(?:\s+today|\s+this week|\s+larger|\s+smaller|$)');
+    final fromRegex = RegExp(r"(?:from|received from)\s+([a-zA-Z0-9_\-'\s]+)");
     final fromMatch = fromRegex.firstMatch(lower);
     if (fromMatch != null) {
-      peerSender = fromMatch.group(1)?.trim();
+      var name = fromMatch.group(1)?.trim() ?? '';
+      name = name
+          .replaceAll(
+            RegExp(r'\s+(today|yesterday|this week|past week|last 7 days|this month|larger.*|smaller.*)$'),
+            '',
+          )
+          .trim();
+      if (name.isNotEmpty) {
+        peerSender = name;
+      }
     }
 
     return StructuredFileFilter(
@@ -91,7 +100,7 @@ class SmartFileSearch {
     final filter = parseQuery(query);
     final now = DateTime.now();
 
-    var results = transfers.where((t) {
+    final results = transfers.where((t) {
       // 1. Category filter
       if (filter.category != null) {
         final ext = t.fileInfo.extension.toLowerCase();
@@ -140,15 +149,36 @@ class SmartFileSearch {
         final senderQuery = filter.peerSender!.toLowerCase();
         final matchesReceiver = t.receivers.any((r) =>
             r.deviceName.toLowerCase().contains(senderQuery) ||
-            r.peerId.toLowerCase().contains(senderQuery));
+            (r.peerId?.toLowerCase().contains(senderQuery) ?? false));
         if (!matchesReceiver && !t.fileInfo.name.toLowerCase().contains(senderQuery)) {
           return false;
         }
       }
 
       // 6. Generic substring matching if no structured filter triggered
-      if (filter.category == null && filter.minSizeBytes == null && filter.maxSizeBytes == null) {
-        final queryWords = query.toLowerCase().split(RegExp(r'\s+')).where((w) => w.length > 2);
+      if (filter.category == null &&
+          filter.minSizeBytes == null &&
+          filter.maxSizeBytes == null &&
+          filter.dateRange == null &&
+          filter.peerSender == null) {
+        const stopWords = {
+          'find',
+          'show',
+          'the',
+          'largest',
+          'biggest',
+          'smallest',
+          'files',
+          'file',
+          'transfers',
+          'all',
+          'get',
+          'list',
+        };
+        final queryWords = query
+            .toLowerCase()
+            .split(RegExp(r'\s+'))
+            .where((w) => w.length > 2 && !stopWords.contains(w));
         for (final word in queryWords) {
           if (!t.fileInfo.name.toLowerCase().contains(word)) {
             return false;

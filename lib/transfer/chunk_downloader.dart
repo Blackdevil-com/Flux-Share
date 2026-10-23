@@ -5,6 +5,18 @@ import '../file/chunk_manager.dart';
 import '../models/chunk.dart';
 import '../models/peer.dart';
 
+class _DigestAccumulator implements Sink<Digest> {
+  Digest? value;
+
+  @override
+  void add(Digest data) {
+    value = data;
+  }
+
+  @override
+  void close() {}
+}
+
 class ChunkDownloadResult {
   final int chunkId;
   final bool success;
@@ -54,7 +66,7 @@ class ChunkDownloader {
     int currentOffset = chunkMeta.offset;
 
     // In-flight streaming hasher (zero whole-chunk RAM allocation)
-    final digestSink = AccumulatorSink<Digest>();
+    final digestSink = _DigestAccumulator();
     final inFlightHasher = sha256.startChunkedConversion(digestSink);
 
     try {
@@ -113,7 +125,7 @@ class ChunkDownloader {
       }
 
       // 2. Verify SHA-256 integrity from streaming digest
-      final computedSha256 = digestSink.events.single.toString();
+      final computedSha256 = digestSink.value?.toString() ?? '';
       if (computedSha256.toLowerCase() != chunkMeta.sha256.toLowerCase()) {
         stopwatch.stop();
         return ChunkDownloadResult(

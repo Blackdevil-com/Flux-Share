@@ -18,6 +18,7 @@ class MetricsCollector {
   int _chunkSize = 0;
   String _coordinatorPeerId = '';
   String _schedulerMode = 'round-robin';
+  String _networkMode = 'wifi';
   int _startTimeMillis = 0;
   int _receiverCount = 0;
 
@@ -34,6 +35,7 @@ class MetricsCollector {
   final Map<String, List<int>> _peerConcurrencyHistory = {};
   final List<RetryEvent> _retryEvents = [];
   final Map<int, int> _timeToFirstByteMillis = {};
+  int? _timeToFirstPreviewReadyMillis;
 
   final List<TransferMetrics> _history = [];
   bool _isInitialized = false;
@@ -68,6 +70,7 @@ class MetricsCollector {
     required String coordinatorPeerId,
     required int receiverCount,
     String schedulerMode = 'round-robin',
+    String networkMode = 'wifi',
   }) {
     _activeTransferId = transferId;
     _fileId = fileId;
@@ -78,6 +81,7 @@ class MetricsCollector {
     _coordinatorPeerId = coordinatorPeerId;
     _receiverCount = receiverCount;
     _schedulerMode = schedulerMode;
+    _networkMode = networkMode;
     _startTimeMillis = DateTime.now().millisecondsSinceEpoch;
 
     _senderUploadVolumeBytes = 0;
@@ -91,6 +95,7 @@ class MetricsCollector {
     _peerConcurrencyHistory.clear();
     _retryEvents.clear();
     _timeToFirstByteMillis.clear();
+    _timeToFirstPreviewReadyMillis = null;
   }
 
   /// Records a chunk delivery from a given source peer.
@@ -117,6 +122,18 @@ class MetricsCollector {
   /// Records Time To First Byte (TTFB) for handshake & connection latency analysis.
   void recordTimeToFirstByte(int chunkId, int ttfbMillis) {
     _timeToFirstByteMillis[chunkId] = ttfbMillis;
+  }
+
+  /// Records time-to-first-preview-ready for streamable/playable media types.
+  void recordTimeToFirstPreviewReady(int elapsedMillis) {
+    if (_timeToFirstPreviewReadyMillis == null) {
+      _timeToFirstPreviewReadyMillis = elapsedMillis;
+    }
+  }
+
+  /// Records network mode (e.g. "wifi" or "hotspot").
+  void recordNetworkMode(String mode) {
+    _networkMode = mode;
   }
 
   /// Records retry event with failed peer and retry peer info.
@@ -215,6 +232,7 @@ class MetricsCollector {
       chunkCount: _chunkCount,
       chunkSize: _chunkSize,
       schedulerMode: _schedulerMode,
+      networkMode: _networkMode,
       receiverCount: _receiverCount,
       startTimeMillis: _startTimeMillis,
       endTimeMillis: endTimeMillis,
@@ -230,6 +248,7 @@ class MetricsCollector {
       retryEvents: List.from(_retryEvents),
       timeToFirstByteMillis: Map.from(_timeToFirstByteMillis),
       avgTimeToFirstByteMillis: avgTtfb,
+      timeToFirstPreviewReadyMillis: _timeToFirstPreviewReadyMillis,
     );
 
     _history.add(metrics);
@@ -237,6 +256,36 @@ class MetricsCollector {
 
     _activeTransferId = null;
     return metrics;
+  }
+
+  /// Exports all metrics records to CSV format with proper RFC 4180 escaping.
+  String exportHistoryToCsv() {
+    final buffer = StringBuffer();
+    buffer.writeln(
+      'TransferId,FileId,FileName,FileSize,ChunkCount,ChunkSize,'
+      'ReceiverCount,NetworkMode,SchedulerMode,TotalDurationMs,'
+      'AggregateThroughputMbps,SenderUploadBytes,CooperativeForwardBytes,'
+      'CooperativeRatio,Retransmissions,AvgTtfbMs,TimeToPreviewReadyMs,StartTime,EndTime',
+    );
+    for (final m in _history) {
+      final escapedFileName = '"${m.fileName.replaceAll('"', '""')}"';
+      buffer.writeln(
+        '${m.transferId},${m.fileId},$escapedFileName,${m.fileSize},${m.chunkCount},${m.chunkSize},'
+        '${m.receiverCount},${m.networkMode},${m.schedulerMode},${m.totalDistributionTimeMillis},'
+        '${m.aggregateThroughputMbps.toStringAsFixed(2)},${m.senderUploadVolumeBytes},${m.cooperativeForwardingVolumeBytes},'
+        '${m.cooperativeRatio.toStringAsFixed(4)},${m.retransmissionCount},${m.avgTimeToFirstByteMillis.toStringAsFixed(1)},'
+        '${m.timeToFirstPreviewReadyMillis ?? ""},${m.startTimeMillis},${m.endTimeMillis}',
+      );
+    }
+    return buffer.toString();
+  }
+
+  /// Writes CSV export to disk and returns the File.
+  Future<File> exportMetricsCsvFile() async {
+    final dir = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/fluxshare_evaluation_metrics_${DateTime.now().millisecondsSinceEpoch}.csv');
+    await file.writeAsString(exportHistoryToCsv(), flush: true);
+    return file;
   }
 
   List<TransferMetrics> getHistory() => List.unmodifiable(_history);

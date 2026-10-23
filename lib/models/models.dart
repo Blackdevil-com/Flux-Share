@@ -1,3 +1,4 @@
+export 'app_settings.dart';
 export 'chunk.dart';
 export 'device.dart';
 export 'file_info.dart';

@@ -6,3 +6,4 @@ export 'secondary_button.dart';
 export 'section_header.dart';
 export 'ai_transfer_insight_card.dart';
 export 'smart_organization_dialog.dart';
+export 'live_swarm_visualization.dart';

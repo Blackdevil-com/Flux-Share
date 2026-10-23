@@ -160,6 +160,151 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
     }
   }
 
+  void _joinRoomDirect(String ip, int port) async {
+    FocusScope.of(context).unfocus();
+    setState(() {
+      _isConnecting = true;
+    });
+
+    try {
+      final httpClient = P2PHttpClient();
+      ManifestFetchResult result;
+      try {
+        result = await httpClient.downloadManifest(ip, port);
+      } finally {
+        httpClient.close();
+      }
+
+      if (result is ManifestFetchSuccess) {
+        final manifest = result.manifest;
+        final room = DiscoveredRoom(
+          roomId: manifest.fileId,
+          ip: ip,
+          port: port,
+          pin: 'DIRECT',
+          deviceName: 'Direct Host ($ip)',
+        );
+        _currentManifest = manifest;
+        _discoveredRoom = room;
+
+        final ext = manifest.fileName.contains('.')
+            ? manifest.fileName.split('.').last.toLowerCase()
+            : '';
+        String formattedSize;
+        final bytes = manifest.fileSize;
+        if (bytes < 1024) {
+          formattedSize = '$bytes B';
+        } else if (bytes < 1024 * 1024) {
+          formattedSize = '${(bytes / 1024).toStringAsFixed(1)} KB';
+        } else if (bytes < 1024 * 1024 * 1024) {
+          formattedSize = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+        } else {
+          formattedSize = '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+        }
+
+        final fileInfo = FileInfo(
+          id: manifest.fileId,
+          name: manifest.fileName,
+          sizeBytes: manifest.fileSize,
+          formattedSize: formattedSize,
+          extension: ext,
+          type: FileType.fromString(ext),
+        );
+
+        if (mounted) {
+          setState(() {
+            _isConnecting = false;
+            _manifestReceived = true;
+            _connectedPin = 'DIRECT';
+            _incomingFile = fileInfo;
+            _senderName = 'Direct Host ($ip)';
+          });
+        }
+      } else if (result is ManifestFetchError) {
+        if (mounted) {
+          setState(() => _isConnecting = false);
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Failed to connect to host: ${result.message}'),
+              backgroundColor: AppColors.primaryBlack,
+            ),
+          );
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isConnecting = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Direct connection error: $e'),
+            backgroundColor: AppColors.primaryBlack,
+          ),
+        );
+      }
+    }
+  }
+
+  void _showDirectConnectDialog() {
+    final ipController = TextEditingController(text: '192.168.43.1');
+    final portController = TextEditingController(text: '8080');
+
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: AppColors.backgroundWhite,
+        shape: AppShapes.cardShape,
+        title: const Text(
+          'Hotspot Direct Connect',
+          style: TextStyle(fontWeight: FontWeight.bold, color: AppColors.primaryBlack),
+        ),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'If UDP broadcast is blocked by hotspot client isolation, connect directly via the host IP address and port.',
+              style: TextStyle(fontSize: 12, color: AppColors.mediumGray),
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: ipController,
+              decoration: const InputDecoration(
+                labelText: 'Host IP Address',
+                hintText: '192.168.43.1',
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: portController,
+              keyboardType: TextInputType.number,
+              decoration: const InputDecoration(
+                labelText: 'Port',
+                hintText: '8080',
+              ),
+            ),
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () {
+              Navigator.pop(context);
+              final ip = ipController.text.trim();
+              final port = int.tryParse(portController.text.trim()) ?? 8080;
+              if (ip.isNotEmpty) {
+                _joinRoomDirect(ip, port);
+              }
+            },
+            child: const Text('Connect'),
+          ),
+        ],
+      ),
+    );
+  }
+
   void _resetToReady() {
     setState(() {
       _manifestReceived = false;
@@ -332,6 +477,31 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                         onPressed: (_pinController.text.length == 4 && !_isConnecting)
                             ? _joinRoom
                             : null,
+                      ),
+                      const SizedBox(height: AppSpacing.s12),
+                      OutlinedButton.icon(
+                        icon: const Icon(
+                          Icons.wifi_tethering_rounded,
+                          size: 18,
+                          color: AppColors.primaryBlack,
+                        ),
+                        label: const Text(
+                          'HOTSPOT DIRECT CONNECT',
+                          style: TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.bold,
+                            letterSpacing: 0.5,
+                            color: AppColors.primaryBlack,
+                          ),
+                        ),
+                        style: OutlinedButton.styleFrom(
+                          minimumSize: const Size(double.infinity, 44),
+                          side: const BorderSide(color: AppColors.borderGray),
+                          shape: RoundedRectangleBorder(
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                        ),
+                        onPressed: _isConnecting ? null : _showDirectConnectDialog,
                       ),
                     ],
                   ),
@@ -546,6 +716,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                             ),
                           );
 
+                          final settings = AppSettings();
                           final engine = TransferEngine(
                             manifest: _currentManifest!,
                             destinationFile: destFile,
@@ -554,7 +725,8 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                             webSocketService: wsService,
                             localPeerId: localServer.localPeerId,
                             coordinatorPeerId: hostPeer.peerId,
-                            concurrentWorkers: 5,
+                            concurrentWorkers: settings.maxParallelConnections,
+                            scheduler: settings.createConfiguredScheduler(),
                           );
 
                           TransferRepository().registerEngine(_currentManifest!.fileId, engine);

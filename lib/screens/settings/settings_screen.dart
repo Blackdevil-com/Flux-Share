@@ -21,6 +21,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
   late double _maxParallelConnections;
   late bool _showNotifications;
   late String _storageLocation;
+  late String _schedulerMode;
 
   @override
   void initState() {
@@ -32,6 +33,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     _storageLocation = _settings.customDownloadPath.isNotEmpty
         ? _settings.customDownloadPath
         : 'App Documents/FluxShare';
+    _schedulerMode = _settings.schedulerMode;
   }
 
   @override
@@ -238,6 +240,33 @@ class _SettingsScreenState extends State<SettingsScreen> {
                   ),
                   activeColor: AppColors.primaryBlack,
                 ),
+                const Divider(height: 1, color: AppColors.borderGray),
+                ListTile(
+                  onTap: _showSchedulerModeDialog,
+                  title: const Text(
+                    'Chunk Scheduling Policy',
+                    style: TextStyle(
+                      fontSize: 15,
+                      fontWeight: FontWeight.w600,
+                      color: AppColors.primaryBlack,
+                    ),
+                  ),
+                  subtitle: Text(
+                    _schedulerMode == 'sequential-priority'
+                        ? 'Sequential-Priority (Fast preview)'
+                        : (_schedulerMode == 'ucb1-adaptive'
+                            ? 'UCB1 Adaptive (Bandit)'
+                            : 'Round-Robin (Baseline)'),
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: AppColors.mediumGray,
+                    ),
+                  ),
+                  trailing: const Icon(
+                    Icons.chevron_right_rounded,
+                    color: AppColors.darkGray,
+                  ),
+                ),
               ],
             ),
           ),
@@ -399,60 +428,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
     );
   }
 
-  void _showEditDeviceNameDialog() {
-    final controller = TextEditingController(text: _deviceName);
-    showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          backgroundColor: AppColors.backgroundWhite,
-          shape: AppShapes.cardShape,
-          title: const Text(
-            'Edit Device Name',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: AppColors.primaryBlack,
-            ),
-          ),
-          content: TextField(
-            controller: controller,
-            autofocus: true,
-            decoration: const InputDecoration(
-              hintText: 'Enter new device name',
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () {
-                final trimmed = controller.text.trim();
-                if (trimmed.isNotEmpty) {
-                  setState(() {
-                    _deviceName = trimmed;
-                  });
-                }
-                Navigator.of(context).pop();
-              },
-              child: const Text('Save'),
-            ),
-          ],
-        );
-      },
-    );
-  }
-
-  void _showStorageLocationDialog() {
-    final List<String> mockLocations = [
-      '/storage/emulated/0/FluxShare',
-      '/storage/emulated/0/Download/FluxShare',
-      '/storage/emulated/0/Documents/FluxShare',
-    ];
-
-    String selectedTemp = _storageLocation;
-
+  void _showSchedulerModeDialog() {
     showDialog(
       context: context,
       builder: (context) {
@@ -462,7 +438,7 @@ class _SettingsScreenState extends State<SettingsScreen> {
               backgroundColor: AppColors.backgroundWhite,
               shape: AppShapes.cardShape,
               title: const Text(
-                'Select Storage Location',
+                'Scheduling Policy',
                 style: TextStyle(
                   fontWeight: FontWeight.bold,
                   color: AppColors.primaryBlack,
@@ -470,44 +446,54 @@ class _SettingsScreenState extends State<SettingsScreen> {
               ),
               content: Column(
                 mainAxisSize: MainAxisSize.min,
-                children: mockLocations.map((loc) {
-                  final isSelected = loc == selectedTemp;
-                  return RadioListTile<String>(
-                    value: loc,
-                    groupValue: selectedTemp,
+                children: [
+                  RadioListTile<String>(
+                    value: 'round-robin',
+                    groupValue: _schedulerMode,
                     activeColor: AppColors.primaryBlack,
-                    title: Text(
-                      loc,
-                      style: TextStyle(
-                        fontSize: 13,
-                        fontWeight:
-                            isSelected ? FontWeight.bold : FontWeight.normal,
-                        color: AppColors.primaryBlack,
-                      ),
-                    ),
-                    onChanged: (val) {
+                    title: const Text('Round-Robin (Baseline)', style: TextStyle(fontWeight: FontWeight.w600)),
+                    subtitle: const Text('Uniform chunk rotation among active peers'),
+                    onChanged: (val) async {
                       if (val != null) {
-                        setDialogState(() => selectedTemp = val);
+                        await _settings.setSchedulerMode(val);
+                        setState(() => _schedulerMode = val);
+                        setDialogState(() {});
+                        if (mounted) Navigator.pop(context);
                       }
                     },
-                  );
-                }).toList(),
+                  ),
+                  RadioListTile<String>(
+                    value: 'sequential-priority',
+                    groupValue: _schedulerMode,
+                    activeColor: AppColors.primaryBlack,
+                    title: const Text('Sequential-Priority', style: TextStyle(fontWeight: FontWeight.w600)),
+                    subtitle: const Text('Prioritizes earliest chunks in order for fast media preview'),
+                    onChanged: (val) async {
+                      if (val != null) {
+                        await _settings.setSchedulerMode(val);
+                        setState(() => _schedulerMode = val);
+                        setDialogState(() {});
+                        if (mounted) Navigator.pop(context);
+                      }
+                    },
+                  ),
+                  RadioListTile<String>(
+                    value: 'ucb1-adaptive',
+                    groupValue: _schedulerMode,
+                    activeColor: AppColors.primaryBlack,
+                    title: const Text('UCB1 Adaptive (Bandit)', style: TextStyle(fontWeight: FontWeight.w600)),
+                    subtitle: const Text('MAB algorithm exploiting high-throughput peers with exploration boost'),
+                    onChanged: (val) async {
+                      if (val != null) {
+                        await _settings.setSchedulerMode(val);
+                        setState(() => _schedulerMode = val);
+                        setDialogState(() {});
+                        if (mounted) Navigator.pop(context);
+                      }
+                    },
+                  ),
+                ],
               ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cancel'),
-                ),
-                ElevatedButton(
-                  onPressed: () {
-                    setState(() {
-                      _storageLocation = selectedTemp;
-                    });
-                    Navigator.of(context).pop();
-                  },
-                  child: const Text('Select'),
-                ),
-              ],
             );
           },
         );

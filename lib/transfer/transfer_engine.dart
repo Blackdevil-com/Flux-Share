@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import '../file/chunk_manager.dart';
 import '../file/file_hasher.dart';
 import '../metrics/metrics_collector.dart';
@@ -25,6 +26,7 @@ class TransferProgressEvent {
   final double speedMbPerSec;
   final int remainingSeconds;
   final String? errorMessage;
+  final bool isPreviewReady;
 
   const TransferProgressEvent({
     required this.transferId,
@@ -35,12 +37,13 @@ class TransferProgressEvent {
     required this.speedMbPerSec,
     required this.remainingSeconds,
     this.errorMessage,
+    this.isPreviewReady = false,
   });
 }
 
 /// Core cooperative transfer orchestration engine.
 /// Features AIMD transport congestion control, persistent HTTP connection reuse,
-/// streaming zero-RAM disk I/O, background isolate hashing, and research metrics.
+/// streaming zero-RAM disk I/O, background isolate hashing, and swappable schedulers.
 class TransferEngine {
   final Manifest manifest;
   final File destinationFile;
@@ -51,6 +54,7 @@ class TransferEngine {
   final ChunkScheduler scheduler;
   final String localPeerId;
   final String coordinatorPeerId;
+  final String networkMode;
 
   late final ReservationManager _reservationManager;
   late final ChunkWriterSession _writerSession;
@@ -60,6 +64,7 @@ class TransferEngine {
 
   final Set<int> _verifiedChunks = {};
   final Map<int, ChunkState> _chunkStates = {};
+  final Map<int, int> _chunkFailureCounts = {};
   final MetricsCollector _metricsCollector = MetricsCollector();
 
   TransferStatus _status = TransferStatus.starting;
@@ -67,6 +72,7 @@ class TransferEngine {
   final Stopwatch _transferStopwatch = Stopwatch();
   Completer<bool>? _completionCompleter;
   Timer? _progressTimer;
+  bool _isPreviewReady = false;
 
   final _progressController = StreamController<TransferProgressEvent>.broadcast();
 
@@ -79,6 +85,7 @@ class TransferEngine {
     required this.localPeerId,
     required this.coordinatorPeerId,
     this.concurrentWorkers = 5,
+    this.networkMode = 'wifi',
     ChunkScheduler? scheduler,
   }) : scheduler = scheduler ?? RoundRobinScheduler() {
     _reservationManager = ReservationManager();
@@ -96,6 +103,9 @@ class TransferEngine {
 
   Stream<TransferProgressEvent> get progressStream => _progressController.stream;
   TransferStatus get status => _status;
+  bool get isPreviewReady => _isPreviewReady;
+  ChunkScheduler get activeScheduler => scheduler;
+
   double get progressPercent => manifest.fileSize > 0
       ? (_bytesTransferred / manifest.fileSize) * 100.0
       : 0.0;
@@ -110,6 +120,11 @@ class TransferEngine {
     _completionCompleter = Completer<bool>();
     _transferStopwatch.start();
 
+    // Map scheduler runtime type to human-readable mode
+    final schedulerName = scheduler.runtimeType.toString()
+        .replaceAll('Scheduler', '')
+        .toLowerCase();
+
     // Initialize metrics recording
     _metricsCollector.startTransfer(
       transferId: manifest.fileId,
@@ -120,7 +135,8 @@ class TransferEngine {
       chunkSize: manifest.chunkSize,
       coordinatorPeerId: coordinatorPeerId,
       receiverCount: swarmPeers.length,
-      schedulerMode: 'round-robin',
+      schedulerMode: schedulerName,
+      networkMode: networkMode,
     );
 
     try {
@@ -183,17 +199,24 @@ class TransferEngine {
       return null;
     }
 
-    // Use swappable scheduler to pick the best peer candidate among available
-    final selectedPeer = scheduler.selectSource(availableMissing, eligibleCandidates);
-    if (selectedPeer == null) {
+    // Use swappable scheduler to select chunk and peer
+    final decision = scheduler.schedule(
+      missingChunks: availableMissing,
+      candidates: eligibleCandidates,
+      coordinatorPeerId: coordinatorPeerId,
+    );
+    if (decision == null) {
       return null;
     }
 
-    // Pick first chunk available from this selected peer
-    final targetChunkId = availableMissing.firstWhere(
-      (id) => selectedPeer.availableChunks.contains(id) || selectedPeer.peerId == coordinatorPeerId,
-      orElse: () => availableMissing.first,
-    );
+    final targetChunkId = decision.chunkId;
+    final selectedPeer = decision.peer;
+
+    // Atomically reserve the chunk for this worker to prevent race conditions
+    final reserved = _reservationManager.tryReserve(targetChunkId, workerId);
+    if (!reserved) {
+      return null;
+    }
 
     final chunkMeta = manifest.chunks.firstWhere((c) => c.chunkId == targetChunkId);
     _chunkStates[targetChunkId] = ChunkState.requested;
@@ -208,7 +231,7 @@ class TransferEngine {
     return (chunk: chunkMeta, peer: selectedPeer);
   }
 
-  /// Handles verified chunk commit: Additive Increase and metrics recording.
+  /// Handles verified chunk commit: Additive Increase, preview check, and metrics recording.
   void _handleChunkSuccess(
     int chunkId,
     String sourcePeerId,
@@ -221,6 +244,15 @@ class TransferEngine {
 
     // Transport AIMD: Additive Increase on success
     _concurrencyManager.markRequestSuccess(sourcePeerId);
+
+    // Provide feedback to active scheduler (e.g. UCB1 reward calculation)
+    scheduler.recordTransferResult(
+      peerId: sourcePeerId,
+      chunkId: chunkId,
+      success: true,
+      bytesTransferred: bytes,
+      duration: _transferStopwatch.elapsed,
+    );
 
     // Record research metrics
     _metricsCollector.recordChunkDelivered(
@@ -238,6 +270,9 @@ class TransferEngine {
       _concurrencyManager.getAllowedConcurrency(sourcePeerId),
     );
 
+    // Check preview-readiness
+    _checkPreviewReadiness();
+
     // Make available immediately on local server for cooperative forwarding!
     localServer.setVerifiedChunks(_verifiedChunks);
 
@@ -254,13 +289,26 @@ class TransferEngine {
     }
   }
 
-  /// Handles chunk failure: Multiplicative Decrease, Cooldown, and immediate retry.
+  /// Handles chunk failure: Multiplicative Decrease, Cooldown, scheduler feedback, and immediate reassignment.
   void _handleChunkFailure(int chunkId, String sourcePeerId, String reason) {
     // Return to MISSING so another worker/peer can retry immediately
     _chunkStates[chunkId] = ChunkState.missing;
 
+    final failures = (_chunkFailureCounts[chunkId] ?? 0) + 1;
+    _chunkFailureCounts[chunkId] = failures;
+
     // Transport AIMD: Multiplicative Decrease & cooldown increment
     _concurrencyManager.markRequestFailure(sourcePeerId);
+
+    // Provide feedback to active scheduler (e.g. UCB1 penalty)
+    scheduler.recordTransferResult(
+      peerId: sourcePeerId,
+      chunkId: chunkId,
+      success: false,
+      bytesTransferred: 0,
+      duration: Duration.zero,
+      errorMessage: reason,
+    );
 
     _metricsCollector.recordRetransmission();
     _metricsCollector.recordRetryEvent(
@@ -274,6 +322,30 @@ class TransferEngine {
     );
 
     _emitProgress();
+  }
+
+  /// Explicit preview readiness detector for media files.
+  void _checkPreviewReadiness() {
+    if (_isPreviewReady) return;
+
+    final ext = manifest.fileName.split('.').last.toLowerCase();
+    final isStreamable = ['mp4', 'mkv', 'mov', 'webm', 'mp3', 'wav', 'm4a', 'pdf'].contains(ext);
+    if (!isStreamable) return;
+
+    // Prerequisite: First 3 chunks (or all chunks if file has fewer) verified
+    final requiredCount = min(3, manifest.chunkCount);
+    bool allRequiredVerified = true;
+    for (int i = 0; i < requiredCount; i++) {
+      if (!_verifiedChunks.contains(i)) {
+        allRequiredVerified = false;
+        break;
+      }
+    }
+
+    if (allRequiredVerified) {
+      _isPreviewReady = true;
+      _metricsCollector.recordTimeToFirstPreviewReady(_transferStopwatch.elapsedMilliseconds);
+    }
   }
 
   /// 3-Tier Completion Verification Gate (Non-negotiable Integrity Rule).
@@ -407,6 +479,7 @@ class TransferEngine {
       speedMbPerSec: speed,
       remainingSeconds: remainingSec,
       errorMessage: errorMessage,
+      isPreviewReady: _isPreviewReady,
     );
 
     _progressController.add(event);

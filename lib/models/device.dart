@@ -35,6 +35,7 @@ class Device {
   final DevicePlatform platform;
   final bool isAvailable;
   final int signalStrength; // 1-4
+  final String? ip;
 
   const Device({
     required this.id,
@@ -42,6 +43,7 @@ class Device {
     required this.platform,
     required this.isAvailable,
     required this.signalStrength,
+    this.ip,
   });
 
   Device copyWith({
@@ -50,6 +52,7 @@ class Device {
     DevicePlatform? platform,
     bool? isAvailable,
     int? signalStrength,
+    String? ip,
   }) {
     return Device(
       id: id ?? this.id,
@@ -57,6 +60,7 @@ class Device {
       platform: platform ?? this.platform,
       isAvailable: isAvailable ?? this.isAvailable,
       signalStrength: signalStrength ?? this.signalStrength,
+      ip: ip ?? this.ip,
     );
   }
 
@@ -67,6 +71,7 @@ class Device {
       'platform': platform.displayName,
       'isAvailable': isAvailable,
       'signalStrength': signalStrength,
+      'ip': ip,
     };
   }
 
@@ -77,6 +82,7 @@ class Device {
       platform: DevicePlatform.fromString(map['platform'] ?? ''),
       isAvailable: map['isAvailable'] ?? true,
       signalStrength: map['signalStrength'] ?? 4,
+      ip: map['ip'] as String?,
     );
   }
 }

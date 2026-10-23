@@ -1,8 +1,17 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:crypto/crypto.dart';
 import '../models/chunk.dart';
 import '../models/manifest.dart';
+
+class _DigestAccumulator implements Sink<Digest> {
+  Digest? value;
+  @override
+  void add(Digest data) => value = data;
+  @override
+  void close() {}
+}
 
 sealed class ManifestFetchResult {}
 
@@ -21,7 +30,9 @@ class ManifestFetchError extends ManifestFetchResult {
 /// HTTP Client for manifest and chunk downloads.
 class P2PHttpClient {
   final HttpClient _client = HttpClient()
-    ..connectionTimeout = const Duration(seconds: 10);
+    ..connectionTimeout = const Duration(seconds: 10)
+    ..idleTimeout = const Duration(seconds: 30)
+    ..maxConnectionsPerHost = 10;
 
   /// Downloads manifest from peer with retries and detailed error reporting.
   Future<ManifestFetchResult> downloadManifest(
@@ -67,7 +78,7 @@ class P2PHttpClient {
         ManifestFetchError(statusCode: 0, message: 'Failed to download manifest', url: url);
   }
 
-  /// Downloads a chunk and writes it directly to [destFile] at chunk offset.
+  /// Downloads a chunk streaming bytes directly to [destFile] with incremental SHA-256 verification.
   Future<bool> downloadChunk(
     String peerIp,
     int peerPort,
@@ -83,22 +94,39 @@ class P2PHttpClient {
         return false;
       }
 
-      final List<int> bytes = [];
-      await for (final data in response) {
-        bytes.addAll(data);
+      final digestSink = _DigestAccumulator();
+      final inFlightHasher = sha256.startChunkedConversion(digestSink);
+
+      final parent = destFile.parent;
+      if (!await parent.exists()) {
+        await parent.create(recursive: true);
       }
 
-      if (bytes.length != chunk.length) {
-        return false;
+      final raf = await destFile.open(mode: FileMode.write);
+      try {
+        await raf.setPosition(chunk.offset);
+        int bytesReceived = 0;
+        await for (final data in response) {
+          inFlightHasher.add(data);
+          bytesReceived += data.length;
+          await raf.writeFrom(data);
+        }
+        inFlightHasher.close();
+        await raf.flush();
+
+        if (bytesReceived != chunk.length) {
+          return false;
+        }
+
+        final computedSha = digestSink.value?.toString() ?? '';
+        if (computedSha.toLowerCase() != chunk.sha256.toLowerCase()) {
+          return false;
+        }
+
+        return true;
+      } finally {
+        await raf.close();
       }
-
-      final raf = await destFile.open(mode: FileMode.append);
-      await raf.setPosition(chunk.offset);
-      await raf.writeFrom(bytes);
-      await raf.flush();
-      await raf.close();
-
-      return true;
     } catch (_) {
       return false;
     }

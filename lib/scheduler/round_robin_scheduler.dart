@@ -3,7 +3,7 @@ import 'chunk_scheduler.dart';
 
 /// Simplest correct implementation of ChunkScheduler.
 /// Rotates sequentially through available candidates that hold at least one missing chunk.
-class RoundRobinScheduler implements ChunkScheduler {
+class RoundRobinScheduler extends ChunkScheduler {
   int _cursor = 0;
 
   @override

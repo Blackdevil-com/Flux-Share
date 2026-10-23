@@ -10,6 +10,7 @@ import '../../models/device.dart';
 import '../../models/file_info.dart';
 import '../../models/manifest.dart';
 import '../../network/local_server.dart';
+import '../../network/network_utils.dart';
 import '../../repositories/device_repository.dart';
 import '../../room/room_manager.dart';
 import '../../widgets/widgets.dart';
@@ -38,6 +39,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   List<Device> _nearbyDevices = [];
   bool _isLoadingDevices = true;
   late String _roomPin;
+  String _hostAddress = '';
 
   @override
   void initState() {
@@ -61,10 +63,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
   Future<void> _loadDevices() async {
     final devices = await _deviceRepository.getNearbyDevices();
+    final ip = await NetworkUtils.getLocalIpAddress();
     if (mounted) {
       setState(() {
         _nearbyDevices = devices;
         _isLoadingDevices = false;
+        _hostAddress = ip ?? '';
       });
     }
   }
@@ -259,9 +263,11 @@ class _SendFileScreenState extends State<SendFileScreen> {
                           ],
                         ),
                         const SizedBox(height: 6),
-                        const Text(
-                          'Share this 4-digit PIN with nearby receivers to join',
-                          style: TextStyle(
+                        Text(
+                          _hostAddress.isNotEmpty
+                              ? 'Direct Host: $_hostAddress • PIN: $_roomPin'
+                              : 'Share this 4-digit PIN with nearby receivers to join',
+                          style: const TextStyle(
                             color: Colors.white70,
                             fontSize: 12,
                           ),
@@ -307,10 +313,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
                   ),
                   const SizedBox(height: AppSpacing.s12),
                   if (_isLoadingDevices)
-                    const Center(
+                    const Padding(
                       padding: EdgeInsets.all(AppSpacing.s24),
-                      child: CircularProgressIndicator(
-                        color: AppColors.primaryBlack,
+                      child: Center(
+                        child: CircularProgressIndicator(
+                          color: AppColors.primaryBlack,
+                        ),
                       ),
                     )
                   else if (_nearbyDevices.isEmpty)
