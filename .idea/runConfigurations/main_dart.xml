@@ -1,6 +1,9 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="main.dart" type="FlutterRunConfigurationType" factoryName="Flutter">
+    <option name="additionalArgs" value="-d emulator-5554" />
     <option name="filePath" value="$PROJECT_DIR$/lib/main.dart" />
-    <method />
+    <method v="2">
+      <option name="RunConfigurationTask" enabled="true" run_configuration_name="Run APP" run_configuration_type="FlutterRunConfigurationType" />
+    </method>
   </configuration>
 </component>
