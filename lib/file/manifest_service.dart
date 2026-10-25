@@ -93,12 +93,28 @@ class ManifestService {
     final fileName = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
     final id = fileId ?? _uuid.v4();
 
+    if (isCancelled?.call() == true) {
+      throw const FormatException('Manifest generation cancelled');
+    }
+
     // Select adaptive chunk size if not explicitly specified
     final effectiveChunkSize = chunkSize ?? selectAdaptiveChunkSize(fileSize);
     final totalChunks = fileSize == 0 ? 0 : (fileSize / effectiveChunkSize).ceil();
 
     // 1. Check verifiable manifest cache first (instant hit for unmodified files)
-    final cached = await ManifestCache.instance.get(file, expectedChunkSize: effectiveChunkSize);
+    debugPrint('[FluxShare-Diag] [B5:CacheLookup] begin: fileId=$id, file=$fileName');
+    Manifest? cached;
+    try {
+      cached = await ManifestCache.instance.get(file, expectedChunkSize: effectiveChunkSize);
+      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=${cached != null ? "hit" : "miss"}');
+    } catch (e) {
+      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=error: $e');
+    }
+
+    if (isCancelled?.call() == true) {
+      throw const FormatException('Manifest generation cancelled');
+    }
+
     if (cached != null) {
       onProgress?.call(ManifestProgress(
         fileId: id,
@@ -159,6 +175,8 @@ class ManifestService {
       return emptyManifest;
     }
 
+    debugPrint('[FluxShare-Diag] [B6:GenBegin] fileId=$id, file=$fileName, totalBytes=$fileSize, chunkSize=$effectiveChunkSize, totalChunks=$totalChunks');
+
     // 2. Offload hashing to background isolate to keep Flutter UI buttery smooth
     if (disableIsolatesForTesting) {
       final manifest = await _hashInProcess(
@@ -171,6 +189,9 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
       await ManifestCache.instance.put(file, manifest);
       return manifest;
     }
@@ -186,6 +207,10 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
 
       // Persist in verifiable cache
       await ManifestCache.instance.put(file, manifest);
@@ -203,6 +228,9 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
       await ManifestCache.instance.put(file, manifest);
       return manifest;
     }
@@ -224,22 +252,48 @@ class ManifestService {
     final isolate = await Isolate.spawn(
       _isolateHashingWorker,
       [filePath, fileId, effectiveChunkSize, receivePort.sendPort],
+      onError: receivePort.sendPort,
       debugName: 'FluxShareManifestWorker',
     );
+    debugPrint('[FluxShare-Diag] [B7:Isolate] started: fileId=$fileId, file=$fileName');
 
     StreamSubscription? sub;
+    Timer? poller;
 
     void cleanup() {
+      poller?.cancel();
       sub?.cancel();
       receivePort.close();
       isolate.kill(priority: Isolate.immediate);
     }
 
+    if (isCancelled != null) {
+      poller = Timer.periodic(const Duration(milliseconds: 30), (_) {
+        if (isCancelled()) {
+          debugPrint('[FluxShare-Diag] [B8:CancelAck] poller detected cancel: fileId=$fileId, file=$fileName');
+          cleanup();
+          if (!completer.isCompleted) {
+            completer.completeError(const FormatException('Manifest generation cancelled'));
+          }
+        }
+      });
+    }
+
     sub = receivePort.listen((message) {
+      if (message is List && message.length >= 2) {
+        final err = message[0].toString();
+        debugPrint('[FluxShare-Diag] [B7:Isolate] uncaught error: fileId=$fileId, file=$fileName, error=$err');
+        cleanup();
+        if (!completer.isCompleted) {
+          completer.completeError(Exception(err));
+        }
+        return;
+      }
       if (message is Map<String, dynamic>) {
         final type = message['type'] as String;
         if (type == 'progress') {
           if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] progress listener detected cancel: fileId=$fileId, file=$fileName');
             cleanup();
             if (!completer.isCompleted) {
               completer.completeError(const FormatException('Manifest generation cancelled'));
@@ -249,6 +303,7 @@ class ManifestService {
           final offset = message['offset'] as int;
           final chunkId = message['chunkId'] as int;
           final progress = fileSize > 0 ? (offset / fileSize).clamp(0.0, 1.0) : 1.0;
+          debugPrint('[FluxShare-Diag] [B7:Isolate] progress: fileId=$fileId, file=$fileName, bytes=$offset/$fileSize, progress=${(progress * 100).toStringAsFixed(1)}%');
           onProgress?.call(ManifestProgress(
             fileId: fileId,
             fileName: fileName,
@@ -260,6 +315,7 @@ class ManifestService {
             totalChunks: totalChunks,
           ));
           if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] progress callback detected cancel: fileId=$fileId, file=$fileName');
             cleanup();
             if (!completer.isCompleted) {
               completer.completeError(const FormatException('Manifest generation cancelled'));
@@ -267,14 +323,24 @@ class ManifestService {
             return;
           }
         } else if (type == 'done') {
+          if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] done discarded due to cancel: fileId=$fileId, file=$fileName');
+            cleanup();
+            if (!completer.isCompleted) {
+              completer.completeError(const FormatException('Manifest generation cancelled'));
+            }
+            return;
+          }
           final manifestJson = message['manifest'] as Map<String, dynamic>;
           final manifest = Manifest.fromJson(manifestJson);
+          debugPrint('[FluxShare-Diag] [B7:Isolate] complete: fileId=$fileId, file=$fileName');
           cleanup();
           if (!completer.isCompleted) {
             completer.complete(manifest);
           }
         } else if (type == 'error') {
           final error = message['error'] as String;
+          debugPrint('[FluxShare-Diag] [B7:Isolate] fail: fileId=$fileId, file=$fileName, error=$error');
           cleanup();
           if (!completer.isCompleted) {
             completer.completeError(Exception(error));
