@@ -1,4 +1,6 @@
+import 'dart:convert';
 import 'dart:io';
+import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import '../models/file_info.dart' as fi;
@@ -10,6 +12,7 @@ class SelectedFilePayload {
   final int sizeBytes;
   final String extension;
   final fi.FileType type;
+  final String? identifier;
 
   const SelectedFilePayload({
     required this.file,
@@ -17,6 +20,7 @@ class SelectedFilePayload {
     required this.sizeBytes,
     required this.extension,
     required this.type,
+    this.identifier,
   });
 
   fi.FileInfo toFileInfo() {
@@ -87,6 +91,7 @@ class FilePickerService {
       }
 
       final f = result.files.first;
+      final String? identifier = f.identifier;
       File? resolvedFile;
       if (f.path != null && f.path!.isNotEmpty) {
         resolvedFile = File(f.path!);
@@ -119,6 +124,7 @@ class FilePickerService {
           sizeBytes: size,
           extension: ext,
           type: fi.FileInfo.detectFileType(ext),
+          identifier: identifier,
         );
       }
     } catch (e, stack) {
@@ -177,21 +183,32 @@ class FilePickerService {
 
       final List<SelectedFilePayload> payloads = [];
       for (final f in result.files) {
+        final String? identifier = f.identifier;
         File? resolvedFile;
         if (f.path != null && f.path!.isNotEmpty) {
           resolvedFile = File(f.path!);
         } else if (f.readStream != null) {
           final tempDir = Directory.systemTemp;
           final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-          resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-          final sink = resolvedFile.openWrite();
-          await f.readStream!.pipe(sink);
+          final stableKey = identifier != null
+              ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
+              : '${f.size}';
+          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
+          if (!await resolvedFile.exists()) {
+            final sink = resolvedFile.openWrite();
+            await f.readStream!.pipe(sink);
+          }
           debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
         } else if (f.bytes != null) {
           final tempDir = Directory.systemTemp;
           final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-          resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-          await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+          final stableKey = identifier != null
+              ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
+              : '${f.size}';
+          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
+          if (!await resolvedFile.exists()) {
+            await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+          }
           debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
         }
 
@@ -209,6 +226,7 @@ class FilePickerService {
             sizeBytes: size,
             extension: ext,
             type: fi.FileInfo.detectFileType(ext),
+            identifier: identifier,
           ));
         } else {
           debugPrint('[FluxShare] Warning: Picked file "${f.name}" has neither path nor bytes available.');

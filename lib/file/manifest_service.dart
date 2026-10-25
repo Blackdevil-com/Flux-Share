@@ -9,6 +9,7 @@ import '../models/file_info.dart';
 import '../models/manifest.dart';
 import 'file_hasher.dart';
 import 'manifest_cache.dart';
+import 'session_manifest_cache.dart';
 
 class _DigestSink implements Sink<Digest> {
   Digest? digest;
@@ -76,12 +77,19 @@ class ManifestService {
   }
 
   /// Generates a complete Manifest from a local file.
-  /// Uses a background isolate so the main UI thread never blocks during multi-GB hashing,
+  /// Uses a two-layer cache:
+  /// 1. Layer B: Transfer-scoped session cache (instant in-memory hit).
+  /// 2. Layer A: Persistent manifest cache (disk + LRU memory).
+  ///
+  /// If both layers miss, offloads hashing to a background isolate
   /// with bounded RAM usage (single chunk buffer in memory) and verifiable caching.
   static Future<Manifest> generateManifest(
     File file, {
     int? chunkSize,
     String? fileId,
+    String? identifier,
+    SessionManifestCache? sessionCache,
+    VoidCallback? onHashingStarted,
     void Function(ManifestProgress progress)? onProgress,
     bool Function()? isCancelled,
   }) async {
@@ -101,12 +109,55 @@ class ManifestService {
     final effectiveChunkSize = chunkSize ?? selectAdaptiveChunkSize(fileSize);
     final totalChunks = fileSize == 0 ? 0 : (fileSize / effectiveChunkSize).ceil();
 
-    // 1. Check verifiable manifest cache first (instant hit for unmodified files)
+    // 1. Layer B: Check transfer-scoped session cache first
+    if (sessionCache != null) {
+      Manifest? sessionCached;
+      try {
+        sessionCached = await sessionCache.get(
+          file: file,
+          identity: identifier ?? file.path,
+          sizeBytes: fileSize,
+          chunkSize: effectiveChunkSize,
+        );
+      } catch (e) {
+        debugPrint('[FluxShare-Cache] [Miss] layer=session, error: $e');
+      }
+
+      if (sessionCached != null) {
+        debugPrint('[FluxShare-Cache] [Action] hashing_started=false, manifest_reused=true, layer=session');
+        onProgress?.call(ManifestProgress(
+          fileId: id,
+          fileName: fileName,
+          bytesProcessed: fileSize,
+          totalBytes: fileSize,
+          progress: 1.0,
+          stage: 'Manifest Ready',
+          currentChunk: totalChunks,
+          totalChunks: totalChunks,
+        ));
+        return Manifest(
+          fileId: id,
+          fileName: fileName,
+          fileSize: sessionCached.fileSize,
+          mimeType: sessionCached.mimeType,
+          chunkSize: sessionCached.chunkSize,
+          chunkCount: sessionCached.chunkCount,
+          fileSha256: sessionCached.fileSha256,
+          chunks: sessionCached.chunks,
+        );
+      }
+    }
+
+    // 2. Layer A: Check verifiable persistent manifest cache
     debugPrint('[FluxShare-Diag] [B5:CacheLookup] begin: fileId=$id, file=$fileName');
-    Manifest? cached;
+    Manifest? persistentCached;
     try {
-      cached = await ManifestCache.instance.get(file, expectedChunkSize: effectiveChunkSize);
-      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=${cached != null ? "hit" : "miss"}');
+      persistentCached = await ManifestCache.instance.get(
+        file,
+        identifier: identifier,
+        expectedChunkSize: effectiveChunkSize,
+      );
+      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=${persistentCached != null ? "hit" : "miss"}');
     } catch (e) {
       debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=error: $e');
     }
@@ -115,7 +166,21 @@ class ManifestService {
       throw const FormatException('Manifest generation cancelled');
     }
 
-    if (cached != null) {
+    if (persistentCached != null) {
+      debugPrint('[FluxShare-Cache] [Action] hashing_started=false, manifest_reused=true, layer=persistent');
+
+      // Populate session cache with persistent hit
+      if (sessionCache != null) {
+        final fp = await ManifestCache.computeHeadTailFingerprint(file, fileSize) ?? '';
+        sessionCache.put(
+          identity: identifier ?? file.path,
+          sizeBytes: fileSize,
+          chunkSize: effectiveChunkSize,
+          fingerprint: fp,
+          manifest: persistentCached,
+        );
+      }
+
       onProgress?.call(ManifestProgress(
         fileId: id,
         fileName: fileName,
@@ -128,15 +193,19 @@ class ManifestService {
       ));
       return Manifest(
         fileId: id,
-        fileName: cached.fileName,
-        fileSize: cached.fileSize,
-        mimeType: cached.mimeType,
-        chunkSize: cached.chunkSize,
-        chunkCount: cached.chunkCount,
-        fileSha256: cached.fileSha256,
-        chunks: cached.chunks,
+        fileName: fileName,
+        fileSize: persistentCached.fileSize,
+        mimeType: persistentCached.mimeType,
+        chunkSize: persistentCached.chunkSize,
+        chunkCount: persistentCached.chunkCount,
+        fileSha256: persistentCached.fileSha256,
+        chunks: persistentCached.chunks,
       );
     }
+
+    // Both cache layers missed -> Notify caller that actual hashing is commencing
+    onHashingStarted?.call();
+    debugPrint('[FluxShare-Cache] [Action] hashing_started=true, manifest_reused=false');
 
     onProgress?.call(ManifestProgress(
       fileId: id,
@@ -161,7 +230,16 @@ class ManifestService {
         fileSha256: sha256.convert(const []).toString(),
         chunks: const [],
       );
-      await ManifestCache.instance.put(file, emptyManifest);
+      if (sessionCache != null) {
+        sessionCache.put(
+          identity: identifier ?? file.path,
+          sizeBytes: 0,
+          chunkSize: effectiveChunkSize,
+          fingerprint: 'empty',
+          manifest: emptyManifest,
+        );
+      }
+      await ManifestCache.instance.put(file, emptyManifest, identifier: identifier);
       onProgress?.call(ManifestProgress(
         fileId: id,
         fileName: fileName,
@@ -177,7 +255,7 @@ class ManifestService {
 
     debugPrint('[FluxShare-Diag] [B6:GenBegin] fileId=$id, file=$fileName, totalBytes=$fileSize, chunkSize=$effectiveChunkSize, totalChunks=$totalChunks');
 
-    // 2. Offload hashing to background isolate to keep Flutter UI buttery smooth
+    // 3. Offload hashing to background isolate to keep Flutter UI buttery smooth
     if (disableIsolatesForTesting) {
       final manifest = await _hashInProcess(
         file: file,
@@ -192,7 +270,18 @@ class ManifestService {
       if (isCancelled?.call() == true) {
         throw const FormatException('Manifest generation cancelled');
       }
-      await ManifestCache.instance.put(file, manifest);
+
+      if (sessionCache != null) {
+        final fp = await ManifestCache.computeHeadTailFingerprint(file, fileSize) ?? '';
+        sessionCache.put(
+          identity: identifier ?? file.path,
+          sizeBytes: fileSize,
+          chunkSize: effectiveChunkSize,
+          fingerprint: fp,
+          manifest: manifest,
+        );
+      }
+      await ManifestCache.instance.put(file, manifest, identifier: identifier);
       return manifest;
     }
 
@@ -212,8 +301,20 @@ class ManifestService {
         throw const FormatException('Manifest generation cancelled');
       }
 
+      // Store in session cache
+      if (sessionCache != null) {
+        final fp = await ManifestCache.computeHeadTailFingerprint(file, fileSize) ?? '';
+        sessionCache.put(
+          identity: identifier ?? file.path,
+          sizeBytes: fileSize,
+          chunkSize: effectiveChunkSize,
+          fingerprint: fp,
+          manifest: manifest,
+        );
+      }
+
       // Persist in verifiable cache
-      await ManifestCache.instance.put(file, manifest);
+      await ManifestCache.instance.put(file, manifest, identifier: identifier);
       return manifest;
     } catch (e) {
       if (e is FormatException) rethrow;
@@ -231,7 +332,18 @@ class ManifestService {
       if (isCancelled?.call() == true) {
         throw const FormatException('Manifest generation cancelled');
       }
-      await ManifestCache.instance.put(file, manifest);
+
+      if (sessionCache != null) {
+        final fp = await ManifestCache.computeHeadTailFingerprint(file, fileSize) ?? '';
+        sessionCache.put(
+          identity: identifier ?? file.path,
+          sizeBytes: fileSize,
+          chunkSize: effectiveChunkSize,
+          fingerprint: fp,
+          manifest: manifest,
+        );
+      }
+      await ManifestCache.instance.put(file, manifest, identifier: identifier);
       return manifest;
     }
   }

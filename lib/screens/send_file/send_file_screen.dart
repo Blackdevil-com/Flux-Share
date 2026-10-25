@@ -6,6 +6,7 @@ import '../../app/theme.dart';
 import '../../discovery/discovery_service.dart';
 import '../../file/file_picker_service.dart';
 import '../../file/manifest_service.dart';
+import '../../file/session_manifest_cache.dart';
 import '../../models/batch_manifest.dart';
 import '../../models/device.dart';
 import '../../models/file_info.dart';
@@ -45,6 +46,7 @@ class PickedFileItem {
   ManifestProgress? progress;
   String? errorMessage;
   bool isCancelled;
+  final String? identifier;
   final ValueNotifier<ManifestProgress?> progressNotifier;
 
   PickedFileItem({
@@ -57,6 +59,7 @@ class PickedFileItem {
     this.progress,
     this.errorMessage,
     this.isCancelled = false,
+    this.identifier,
   }) : progressNotifier = ValueNotifier<ManifestProgress?>(progress);
 
   bool get isReady => status.isManifestReady && manifest != null;
@@ -68,6 +71,7 @@ class PickedFileItem {
       sizeBytes: info.sizeBytes,
       extension: info.extension,
       type: info.type,
+      identifier: identifier,
     );
   }
 }
@@ -108,6 +112,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   final DeviceRepository _deviceRepository = DeviceRepository();
   final DiscoveryService _discoveryService = DiscoveryService();
   final List<PickedFileItem> _selectedFiles = [];
+  final SessionManifestCache _sessionCache = SessionManifestCache();
   final Set<int> _activeWorkerJobIds = {};
   static const int _maxConcurrentWorkers = 2;
   final Set<String> _selectedDeviceIds = {};
@@ -155,6 +160,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
       item.jobId++;
       item.progressNotifier.dispose();
     }
+    _sessionCache.clear();
     _manifestUpdateNotifier.dispose();
     super.dispose();
   }
@@ -266,6 +272,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
           file: payload.file,
           info: payload.toFileInfo(),
           status: FilePreparationStatus.selected,
+          identifier: payload.identifier,
         );
         _selectedFiles.add(item);
         addedCount++;
@@ -619,6 +626,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
         file: item.payload.file,
         info: item.payload.toFileInfo(),
         status: FilePreparationStatus.selected,
+        identifier: item.payload.identifier,
       );
       _selectedFiles.add(newItem);
       newlyAddedCount++;
@@ -805,17 +813,20 @@ class _SendFileScreenState extends State<SendFileScreen> {
         return;
       }
 
-      if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
-        setState(() {
-          targetItem.status = FilePreparationStatus.hashing;
-        });
-        _manifestUpdateNotifier.value++;
-        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, from=preparing, to=hashing');
-      }
-
       final manifest = await ManifestService.generateManifest(
         targetItem.file,
         fileId: targetItem.id,
+        identifier: targetItem.identifier,
+        sessionCache: _sessionCache,
+        onHashingStarted: () {
+          if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+            setState(() {
+              targetItem.status = FilePreparationStatus.hashing;
+            });
+            _manifestUpdateNotifier.value++;
+            debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, from=preparing, to=hashing');
+          }
+        },
         onProgress: (p) {
           if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
             targetItem.progress = p;
@@ -834,7 +845,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
           targetItem.errorMessage = null;
         });
         _manifestUpdateNotifier.value++;
-        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, from=hashing, to=manifestReady');
+        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, to=manifestReady');
       } else {
         outcome = 'cancelled_on_completion';
       }
