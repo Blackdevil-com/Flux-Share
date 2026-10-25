@@ -85,8 +85,14 @@ class ManifestCache {
     }
   }
 
-  /// Generates a normalized cache key.
-  String _generateKey(String path, int size, int lastModifiedMs, int chunkSize) {
+  /// Generates a normalized cache key based on file identity, size, and chunk size.
+  String _generateKey(String identity, int size, int chunkSize) {
+    final normalized = identity.replaceAll('\\', '/');
+    return '$normalized:$size:$chunkSize';
+  }
+
+  /// Legacy key generator including last-modified timestamp for backward compatibility.
+  String _generateLegacyKey(String path, int size, int lastModifiedMs, int chunkSize) {
     final normalizedPath = path.replaceAll('\\', '/');
     return '$normalizedPath:$size:$lastModifiedMs:$chunkSize';
   }
@@ -123,7 +129,7 @@ class ManifestCache {
 
       return sink.digest?.toString();
     } catch (e) {
-      debugPrint('[ManifestCache] Fingerprint read error: $e');
+      debugPrint('[FluxShare-Cache] Fingerprint read error: $e');
       return null;
     } finally {
       try {
@@ -133,10 +139,17 @@ class ManifestCache {
   }
 
   /// Looks up a cached manifest for [file].
+  ///
+  /// Can be queried by platform [identifier] (such as Android Content URI)
+  /// and/or underlying [file.path].
+  ///
   /// Returns null if not cached, if modified, or if fingerprint validation fails.
-  Future<Manifest?> get(File file, {int? expectedChunkSize}) async {
+  Future<Manifest?> get(File file, {String? identifier, int? expectedChunkSize}) async {
     try {
-      if (!await file.exists()) return null;
+      if (!await file.exists()) {
+        debugPrint('[FluxShare-Cache] [Miss] layer=persistent, reason=file_not_found_on_disk');
+        return null;
+      }
 
       final length = await file.length();
       final lastModified = (await file.lastModified()).millisecondsSinceEpoch;
@@ -167,98 +180,145 @@ class ManifestCache {
         ];
       }
 
+      final List<String> candidateIdentities = [];
+      if (identifier != null && identifier.isNotEmpty) {
+        candidateIdentities.add(identifier);
+      }
+      candidateIdentities.add(file.path);
+
       String? currentFingerprint;
 
       for (final cs in chunkSizes) {
-        final key = _generateKey(file.path, length, lastModified, cs);
+        for (final id in candidateIdentities) {
+          final modernKey = _generateKey(id, length, cs);
+          final legacyKey = _generateLegacyKey(id, length, lastModified, cs);
 
-        // 1. Check in-memory cache
-        if (_memoryCache.containsKey(key)) {
-          final entry = _memoryCache[key]!;
-          currentFingerprint ??= await computeHeadTailFingerprint(file, length);
-          if (currentFingerprint != null && currentFingerprint == entry.fingerprint) {
-            return entry.manifest;
-          } else {
-            // File content changed despite same size/timestamp -> invalidate
-            _memoryCache.remove(key);
-          }
-        }
+          for (final key in [modernKey, legacyKey]) {
+            debugPrint('[FluxShare-Cache] [Query] layer=persistent, key=$key, file=${file.path}');
 
-        // 2. Check per-entry disk file
-        final cacheDir = await _getCacheDirectory();
-        if (cacheDir != null) {
-          final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
-          if (await cacheFile.exists()) {
-            final raw = await cacheFile.readAsString();
-            final Map<String, dynamic> json = jsonDecode(raw) as Map<String, dynamic>;
+            // 1. Check in-memory LRU cache
+            if (_memoryCache.containsKey(key)) {
+              final entry = _memoryCache[key]!;
+              currentFingerprint ??= await computeHeadTailFingerprint(file, length);
+              if (currentFingerprint != null && currentFingerprint == entry.fingerprint) {
+                debugPrint('[FluxShare-Cache] [Hit] layer=persistent, source=memory, key=$key, chunks=${entry.manifest.chunkCount}');
+                return entry.manifest;
+              } else {
+                _memoryCache.remove(key);
+                debugPrint('[FluxShare-Cache] [Miss] layer=persistent, source=memory, key=$key, reason=fingerprint_mismatch');
+              }
+            }
 
-            final cachedFingerprint = json['fingerprint'] as String?;
-            final manifestJson = json['manifest'] as Map<String, dynamic>;
-            final manifest = Manifest.fromJson(manifestJson);
+            // 2. Check per-entry disk file
+            final cacheDir = await _getCacheDirectory();
+            if (cacheDir != null) {
+              final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
+              if (await cacheFile.exists()) {
+                try {
+                  final raw = await cacheFile.readAsString();
+                  final Map<String, dynamic> json = jsonDecode(raw) as Map<String, dynamic>;
 
-            // Verify head/tail fingerprint
-            currentFingerprint ??= await computeHeadTailFingerprint(file, length);
-            if (currentFingerprint != null && currentFingerprint == cachedFingerprint) {
-              // Populate in-memory LRU cache
-              _addToMemoryCache(key, _CachedManifestEntry(
-                manifest: manifest,
-                fingerprint: currentFingerprint,
-                cachedAt: DateTime.now(),
-              ));
-              return manifest;
-            } else {
-              // Stale entry, delete disk file
-              try {
-                await cacheFile.delete();
-              } catch (_) {}
+                  final cachedFingerprint = json['fingerprint'] as String?;
+                  final cachedSize = json['size'] as int? ?? length;
+                  if (cachedSize != length) {
+                    try {
+                      await cacheFile.delete();
+                    } catch (_) {}
+                    debugPrint('[FluxShare-Cache] [Miss] layer=persistent, source=disk, key=$key, reason=size_mismatch: $cachedSize != $length');
+                    continue;
+                  }
+
+                  final manifestJson = json['manifest'] as Map<String, dynamic>;
+                  final manifest = Manifest.fromJson(manifestJson);
+
+                  // Verify head/tail fingerprint
+                  currentFingerprint ??= await computeHeadTailFingerprint(file, length);
+                  if (currentFingerprint != null && currentFingerprint == cachedFingerprint) {
+                    _addToMemoryCache(key, _CachedManifestEntry(
+                      manifest: manifest,
+                      fingerprint: currentFingerprint,
+                      cachedAt: DateTime.now(),
+                    ));
+                    debugPrint('[FluxShare-Cache] [Hit] layer=persistent, source=disk, key=$key, chunks=${manifest.chunkCount}');
+                    return manifest;
+                  } else {
+                    try {
+                      await cacheFile.delete();
+                    } catch (_) {}
+                    debugPrint('[FluxShare-Cache] [Miss] layer=persistent, source=disk, key=$key, reason=fingerprint_mismatch');
+                  }
+                } catch (corruptError) {
+                  // Corrupted cache file: safely delete and continue without failing
+                  try {
+                    await cacheFile.delete();
+                  } catch (_) {}
+                  debugPrint('[FluxShare-Cache] [Miss] layer=persistent, source=disk, key=$key, reason=corrupted_file: $corruptError');
+                }
+              }
             }
           }
         }
       }
     } catch (e) {
-      debugPrint('[ManifestCache] Cache lookup warning: $e');
+      debugPrint('[FluxShare-Cache] [Error] layer=persistent, lookup_exception: $e');
     }
     return null;
   }
 
   /// Stores a verified manifest into memory and disk cache.
-  Future<void> put(File file, Manifest manifest) async {
+  Future<void> put(File file, Manifest manifest, {String? identifier}) async {
     try {
       if (!await file.exists()) return;
 
       final length = await file.length();
       final lastModified = (await file.lastModified()).millisecondsSinceEpoch;
-      final key = _generateKey(file.path, length, lastModified, manifest.chunkSize);
+      final fingerprint = await computeHeadTailFingerprint(file, length);
+      if (fingerprint == null) {
+        debugPrint('[FluxShare-Cache] [Persist] fingerprint failed, skipping cache write');
+        return;
+      }
 
-      final fingerprint = await computeHeadTailFingerprint(file, length) ?? '';
-
-      final entry = _CachedManifestEntry(
-        manifest: manifest,
-        fingerprint: fingerprint,
-        cachedAt: DateTime.now(),
-      );
-
-      _addToMemoryCache(key, entry);
-
-      // Persist entry atomically to disk
       final cacheDir = await _getCacheDirectory();
-      if (cacheDir != null) {
-        final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
-        final data = jsonEncode({
-          'key': key,
-          'fingerprint': fingerprint,
-          'cachedAtMs': entry.cachedAt.millisecondsSinceEpoch,
-          'manifest': manifest.toJson(),
-        });
-        await cacheFile.writeAsString(data, flush: true);
+
+      final List<String> candidateIdentities = [];
+      if (identifier != null && identifier.isNotEmpty) {
+        candidateIdentities.add(identifier);
+      }
+      candidateIdentities.add(file.path);
+
+      for (final id in candidateIdentities) {
+        final key = _generateKey(id, length, manifest.chunkSize);
+        final entry = _CachedManifestEntry(
+          manifest: manifest,
+          fingerprint: fingerprint,
+          cachedAt: DateTime.now(),
+        );
+
+        _addToMemoryCache(key, entry);
+
+        if (cacheDir != null) {
+          final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
+          final data = jsonEncode({
+            'key': key,
+            'identifier': id,
+            'size': length,
+            'chunkSize': manifest.chunkSize,
+            'lastModifiedMs': lastModified,
+            'fingerprint': fingerprint,
+            'cachedAtMs': entry.cachedAt.millisecondsSinceEpoch,
+            'manifest': manifest.toJson(),
+          });
+          await cacheFile.writeAsString(data, flush: true);
+          debugPrint('[FluxShare-Cache] [Store] layer=persistent, key=$key, chunks=${manifest.chunkCount}');
+        }
       }
     } catch (e) {
-      debugPrint('[ManifestCache] Cache write warning: $e');
+      debugPrint('[FluxShare-Cache] [Error] layer=persistent, write_exception: $e');
     }
   }
 
   /// Invalidates and removes cache for a specific file.
-  Future<void> invalidate(File file, {int? expectedChunkSize}) async {
+  Future<void> invalidate(File file, {String? identifier, int? expectedChunkSize}) async {
     try {
       if (!await file.exists()) return;
       final length = await file.length();
@@ -268,20 +328,33 @@ class ManifestCache {
           ? [expectedChunkSize]
           : [512 * 1024, 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024];
 
-      for (final cs in chunkSizes) {
-        final key = _generateKey(file.path, length, lastModified, cs);
-        _memoryCache.remove(key);
+      final candidateIdentities = [
+        if (identifier != null && identifier.isNotEmpty) identifier,
+        file.path,
+      ];
 
-        final cacheDir = await _getCacheDirectory();
-        if (cacheDir != null) {
-          final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
-          if (await cacheFile.exists()) {
-            await cacheFile.delete();
+      for (final cs in chunkSizes) {
+        for (final id in candidateIdentities) {
+          final modernKey = _generateKey(id, length, cs);
+          final legacyKey = _generateLegacyKey(id, length, lastModified, cs);
+
+          for (final key in [modernKey, legacyKey]) {
+            _memoryCache.remove(key);
+
+            final cacheDir = await _getCacheDirectory();
+            if (cacheDir != null) {
+              final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
+              if (await cacheFile.exists()) {
+                try {
+                  await cacheFile.delete();
+                } catch (_) {}
+              }
+            }
           }
         }
       }
     } catch (e) {
-      debugPrint('[ManifestCache] Cache invalidation warning: $e');
+      debugPrint('[FluxShare-Cache] [Error] layer=persistent, invalidation_exception: $e');
     }
   }
 
