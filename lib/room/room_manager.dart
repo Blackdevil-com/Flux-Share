@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import '../models/batch_manifest.dart';
 import '../models/manifest.dart';
 import '../models/peer.dart';
 
@@ -19,6 +20,7 @@ class RoomSession {
   final DateTime createdAt;
   RoomState state;
   Manifest? manifest;
+  BatchManifest? batchManifest;
   final Map<String, PeerInfo> joinedPeers = {};
 
   RoomSession({
@@ -29,6 +31,7 @@ class RoomSession {
     required this.createdAt,
     this.state = RoomState.created,
     this.manifest,
+    this.batchManifest,
   });
 
   Map<String, dynamic> toJson() => {
@@ -40,6 +43,7 @@ class RoomSession {
     'createdAt': createdAt.toIso8601String(),
     'joinedPeers': joinedPeers.values.map((p) => p.toJson()).toList(),
     'manifest': manifest?.toJson(),
+    'batchManifest': batchManifest?.toJson(),
   };
 }
 
@@ -67,6 +71,7 @@ class RoomManager {
     required String hostDeviceName,
     String? customPin,
     Manifest? manifest,
+    BatchManifest? batchManifest,
   }) {
     final pin = customPin ?? generatePin();
     final roomId = 'room_${DateTime.now().millisecondsSinceEpoch}';
@@ -79,6 +84,7 @@ class RoomManager {
       createdAt: DateTime.now(),
       state: RoomState.created,
       manifest: manifest,
+      batchManifest: batchManifest,
     );
 
     _currentRoom = room;

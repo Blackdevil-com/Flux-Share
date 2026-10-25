@@ -1,4 +1,5 @@
 export 'app_settings.dart';
+export 'batch_manifest.dart';
 export 'chunk.dart';
 export 'device.dart';
 export 'file_info.dart';

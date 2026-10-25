@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import '../models/peer.dart';
+import '../network/multicast_lock_service.dart';
 import '../network/network_utils.dart';
 import 'discovery_packet.dart';
 
@@ -36,6 +37,7 @@ class DiscoveryService {
     int discoveryPort = defaultDiscoveryPort,
   }) async {
     stopRoomHost();
+    await MulticastLockService.acquire();
 
     try {
       final socket = await RawDatagramSocket.bind(
@@ -76,6 +78,7 @@ class DiscoveryService {
   void stopRoomHost() {
     _hostSocket?.close();
     _hostSocket = null;
+    MulticastLockService.release();
   }
 
   /// Starts background listener to respond to nearby peer discovery scans.
@@ -87,6 +90,7 @@ class DiscoveryService {
     int discoveryPort = defaultDiscoveryPort,
   }) async {
     stopPeerPresenceListener();
+    await MulticastLockService.acquire();
     try {
       final socket = await RawDatagramSocket.bind(
         InternetAddress.anyIPv4,
@@ -125,6 +129,7 @@ class DiscoveryService {
   void stopPeerPresenceListener() {
     _presenceSocket?.close();
     _presenceSocket = null;
+    MulticastLockService.release();
   }
 
   /// Broadcasts UDP discovery packets to locate nearby active peers on the LAN.
@@ -134,6 +139,7 @@ class DiscoveryService {
   }) async {
     final discovered = <String, PeerInfo>{};
     RawDatagramSocket? socket;
+    await MulticastLockService.acquire();
 
     try {
       socket = await RawDatagramSocket.bind(
@@ -166,7 +172,6 @@ class DiscoveryService {
         }
       });
 
-      final completer = Completer<void>();
       socket.listen((RawSocketEvent event) {
         if (event == RawSocketEvent.read) {
           final datagram = socket?.receive();
@@ -204,6 +209,8 @@ class DiscoveryService {
     } catch (_) {
       socket?.close();
       return discovered.values.toList();
+    } finally {
+      await MulticastLockService.release();
     }
   }
 
@@ -215,6 +222,7 @@ class DiscoveryService {
   }) async {
     RawDatagramSocket? clientSocket;
     final completer = Completer<DiscoveredRoom?>();
+    await MulticastLockService.acquire();
 
     try {
       clientSocket = await RawDatagramSocket.bind(
@@ -293,6 +301,8 @@ class DiscoveryService {
     } catch (_) {
       clientSocket?.close();
       return null;
+    } finally {
+      await MulticastLockService.release();
     }
   }
 }
