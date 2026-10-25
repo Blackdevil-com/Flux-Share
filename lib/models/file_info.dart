@@ -63,6 +63,48 @@ class FileInfo {
     required this.type,
   });
 
+  static String formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
+  static FileType detectFileType(String ext) {
+    if (['mp4', 'mkv', 'avi', 'mov', 'webm'].contains(ext)) {
+      return FileType.Video;
+    } else if (['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp'].contains(ext)) {
+      return FileType.Image;
+    } else if (['pdf', 'doc', 'docx', 'txt', 'rtf'].contains(ext)) {
+      return FileType.Document;
+    } else if (['zip', 'rar', '7z', 'tar', 'gz'].contains(ext)) {
+      return FileType.Archive;
+    } else if (['ppt', 'pptx'].contains(ext)) {
+      return FileType.Presentation;
+    } else {
+      return FileType.Other;
+    }
+  }
+
+  factory FileInfo.fromMetadata({
+    required String path,
+    required String name,
+    required int sizeBytes,
+    String? extension,
+    FileType? type,
+  }) {
+    final ext = extension ?? (name.contains('.') ? name.split('.').last.toLowerCase() : '');
+    final resolvedType = type ?? detectFileType(ext);
+    return FileInfo(
+      id: path,
+      name: name,
+      sizeBytes: sizeBytes,
+      formattedSize: formatBytes(sizeBytes),
+      extension: ext,
+      type: resolvedType,
+    );
+  }
+
   static Future<FileInfo> fromFile(File file) async {
     final name = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
     final length = await file.length();

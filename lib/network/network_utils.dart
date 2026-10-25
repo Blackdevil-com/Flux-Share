@@ -3,9 +3,11 @@ import 'dart:async';
 
 /// Network utilities for interface detection, IP resolution, and reachability.
 class NetworkUtils {
+  static String? customLocalIp;
   /// Discovers local non-loopback IPv4 address on active LAN interfaces.
   /// Prioritizes Wi-Fi (wlan, ap, p2p) and Ethernet (eth), filtering out virtual/VPN/cellular.
   static Future<String?> getLocalIpAddress() async {
+    if (customLocalIp != null) return customLocalIp;
     try {
       final interfaces = await NetworkInterface.list(
         includeLoopback: false,
