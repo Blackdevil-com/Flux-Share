@@ -45,6 +45,7 @@ class PickedFileItem {
   ManifestProgress? progress;
   String? errorMessage;
   bool isCancelled;
+  final ValueNotifier<ManifestProgress?> progressNotifier;
 
   PickedFileItem({
     required this.id,
@@ -56,7 +57,7 @@ class PickedFileItem {
     this.progress,
     this.errorMessage,
     this.isCancelled = false,
-  });
+  }) : progressNotifier = ValueNotifier<ManifestProgress?>(progress);
 
   bool get isReady => status.isManifestReady && manifest != null;
 
@@ -89,12 +90,14 @@ class SendFileScreen extends StatefulWidget {
   final FileInfo? initialFile;
   final String? initialDeviceId;
   final List<PickedFileItem>? initialPickedItems;
+  final Manifest? initialManifest;
 
   const SendFileScreen({
     super.key,
     this.initialFile,
     this.initialDeviceId,
     this.initialPickedItems,
+    this.initialManifest,
   });
 
   @override
@@ -105,6 +108,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
   final DeviceRepository _deviceRepository = DeviceRepository();
   final DiscoveryService _discoveryService = DiscoveryService();
   final List<PickedFileItem> _selectedFiles = [];
+  final Set<int> _activeWorkerJobIds = {};
+  static const int _maxConcurrentWorkers = 2;
   final Set<String> _selectedDeviceIds = {};
   final ValueNotifier<int> _manifestUpdateNotifier = ValueNotifier<int>(0);
   List<Device> _nearbyDevices = [];
@@ -127,10 +132,15 @@ class _SendFileScreenState extends State<SendFileScreen> {
           jobId: 1,
           file: file,
           info: widget.initialFile!,
-          status: FilePreparationStatus.selected,
+          status: widget.initialManifest != null
+              ? FilePreparationStatus.manifestReady
+              : FilePreparationStatus.selected,
+          manifest: widget.initialManifest,
         ),
       );
-      _startPreparationQueue();
+      if (widget.initialManifest == null) {
+        _startPreparationQueue();
+      }
     }
     if (widget.initialDeviceId != null) {
       _selectedDeviceIds.add(widget.initialDeviceId!);
@@ -143,6 +153,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
     for (final item in _selectedFiles) {
       item.isCancelled = true;
       item.jobId++;
+      item.progressNotifier.dispose();
     }
     _manifestUpdateNotifier.dispose();
     super.dispose();
@@ -230,9 +241,22 @@ class _SendFileScreenState extends State<SendFileScreen> {
       int addedCount = 0;
       for (final payload in payloads) {
         final path = payload.file.path;
-        if (_selectedFiles.any((item) =>
+        final existingIndex = _selectedFiles.indexWhere((item) =>
             item.file.path == path ||
-            (item.info.name == payload.name && item.info.sizeBytes == payload.sizeBytes))) {
+            (item.info.name == payload.name && item.info.sizeBytes == payload.sizeBytes));
+
+        if (existingIndex != -1) {
+          final existing = _selectedFiles[existingIndex];
+          if (existing.status == FilePreparationStatus.cancelled ||
+              existing.status == FilePreparationStatus.error) {
+            existing.isCancelled = false;
+            existing.errorMessage = null;
+            existing.progress = null;
+            existing.jobId++;
+            existing.status = FilePreparationStatus.selected;
+            addedCount++;
+            debugPrint('[FluxShare-Diag] [B1:Select] Re-selected existing cancelled/error file: jobId=${existing.jobId}, file=${existing.info.name}');
+          }
           continue;
         }
 
@@ -245,6 +269,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
         );
         _selectedFiles.add(item);
         addedCount++;
+        debugPrint('[FluxShare-Diag] [B1:Select] jobId=${item.jobId}, file=${item.info.name}, size=${item.info.sizeBytes}');
       }
 
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
@@ -262,6 +287,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
         }
       }
 
+      await Future<void>.delayed(Duration.zero);
+      if (!mounted) return;
       _startPreparationQueue();
     } catch (e) {
       if (mounted) {
@@ -555,8 +582,10 @@ class _SendFileScreenState extends State<SendFileScreen> {
     final confirmedExisting = confirmed.where((i) => i.isExisting).map((i) => i.originalItem!).toSet();
     for (final item in List<PickedFileItem>.from(_selectedFiles)) {
       if (!confirmedExisting.contains(item)) {
+        debugPrint('[FluxShare-Diag] [B8:CancelReq] jobId=${item.jobId}, file=${item.info.name}, reason=removed_in_change_review');
         item.isCancelled = true;
         item.jobId++;
+        item.progressNotifier.dispose();
         _selectedFiles.remove(item);
       }
     }
@@ -564,22 +593,36 @@ class _SendFileScreenState extends State<SendFileScreen> {
     // 2. Identify newly added files: append to _selectedFiles
     int newlyAddedCount = 0;
     for (final item in confirmed.where((i) => !i.isExisting)) {
-      final isDup = _selectedFiles.any((existing) =>
+      final existingIndex = _selectedFiles.indexWhere((existing) =>
           existing.file.path == item.payload.file.path ||
           (existing.info.name == item.payload.name &&
               existing.info.sizeBytes == item.payload.sizeBytes));
-      if (!isDup) {
-        _selectedFiles.add(
-          PickedFileItem(
-            id: '${item.payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
-            jobId: 1,
-            file: item.payload.file,
-            info: item.payload.toFileInfo(),
-            status: FilePreparationStatus.selected,
-          ),
-        );
-        newlyAddedCount++;
+
+      if (existingIndex != -1) {
+        final existing = _selectedFiles[existingIndex];
+        if (existing.status == FilePreparationStatus.cancelled ||
+            existing.status == FilePreparationStatus.error) {
+          existing.isCancelled = false;
+          existing.status = FilePreparationStatus.selected;
+          existing.errorMessage = null;
+          existing.progress = null;
+          existing.jobId++;
+          newlyAddedCount++;
+          debugPrint('[FluxShare-Diag] [B1:Select] Re-selected cancelled/error file in change review: jobId=${existing.jobId}, file=${existing.info.name}');
+        }
+        continue;
       }
+
+      final newItem = PickedFileItem(
+        id: '${item.payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+        jobId: 1,
+        file: item.payload.file,
+        info: item.payload.toFileInfo(),
+        status: FilePreparationStatus.selected,
+      );
+      _selectedFiles.add(newItem);
+      newlyAddedCount++;
+      debugPrint('[FluxShare-Diag] [B1:Select] jobId=${newItem.jobId}, file=${newItem.info.name}, size=${newItem.info.sizeBytes}');
     }
 
     if (mounted) {
@@ -595,7 +638,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
       );
     }
 
-    _startPreparationQueue();
+    Future.microtask(() {
+      if (mounted) _startPreparationQueue();
+    });
   }
 
   void _confirmClearAll() {
@@ -627,30 +672,52 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
   void _clearAllFiles() {
     for (final item in _selectedFiles) {
+      debugPrint('[FluxShare-Diag] [B8:CancelReq] jobId=${item.jobId}, file=${item.info.name}, reason=clear_all');
       item.isCancelled = true;
       item.jobId++;
+      item.progressNotifier.dispose();
     }
     setState(() {
       _selectedFiles.clear();
     });
     _manifestUpdateNotifier.value++;
     debugPrint('[FluxShare] Selection state contains: 0 files');
+    _runPreparationWorkers();
   }
 
   void _removeFileAt(int index) {
     if (index >= 0 && index < _selectedFiles.length) {
       final removed = _selectedFiles[index];
+      debugPrint('[FluxShare-Diag] [B8:CancelReq] jobId=${removed.jobId}, file=${removed.info.name}, reason=file_removed');
       removed.isCancelled = true;
       removed.jobId++;
+      removed.progressNotifier.dispose();
       setState(() {
         _selectedFiles.removeAt(index);
       });
       _manifestUpdateNotifier.value++;
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
+      _runPreparationWorkers();
     }
   }
 
+  void _cancelPreparation(PickedFileItem item) {
+    debugPrint('[FluxShare-Diag] [B8:CancelReq] jobId=${item.jobId}, file=${item.info.name}, reason=user_cancelled');
+    item.isCancelled = true;
+    item.jobId++;
+    setState(() {
+      item.status = FilePreparationStatus.cancelled;
+      item.progress = null;
+      item.errorMessage = null;
+    });
+    item.progressNotifier.value = null;
+    _manifestUpdateNotifier.value++;
+    debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=${item.jobId}, file=${item.info.name}, from=hashing, to=cancelled');
+    _runPreparationWorkers();
+  }
+
   void _retryPreparation(PickedFileItem item) {
+    debugPrint('[FluxShare-Diag] [B1:Select] retry jobId=${item.jobId + 1}, file=${item.info.name}');
     item.isCancelled = false;
     item.status = FilePreparationStatus.selected;
     item.errorMessage = null;
@@ -668,34 +735,50 @@ class _SendFileScreenState extends State<SendFileScreen> {
     final pending = _selectedFiles.where((i) => i.status == FilePreparationStatus.selected).toList();
     for (final item in pending) {
       item.status = FilePreparationStatus.queued;
+      debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=${item.jobId}, file=${item.info.name}, from=selected, to=queued');
     }
+    debugPrint('[FluxShare-Diag] [B2:Scheduler] queueInvoked: pendingSelected=${pending.length}, totalSelectedFiles=${_selectedFiles.length}');
     _runPreparationWorkers();
   }
 
   void _runPreparationWorkers() {
-    final activeCount = _selectedFiles
-        .where((i) =>
-            i.status == FilePreparationStatus.preparing ||
-            i.status == FilePreparationStatus.hashing)
-        .length;
+    if (!mounted) return;
 
     final queuedItems = _selectedFiles
         .where((i) => i.status == FilePreparationStatus.queued)
         .toList();
 
-    final availableSlots = (2 - activeCount).clamp(0, 2);
+    final beforeActive = _activeWorkerJobIds.length;
+    final availableSlots = (_maxConcurrentWorkers - beforeActive).clamp(0, _maxConcurrentWorkers);
+
+    debugPrint('[FluxShare-Diag] [B2:Scheduler] runWorkers: activeWorkers=$beforeActive, queued=${queuedItems.length}, availableSlots=$availableSlots');
+
+    int admittedCount = 0;
     for (int i = 0; i < availableSlots && i < queuedItems.length; i++) {
       final item = queuedItems[i];
-      _processItem(item).then((_) {
+      // Mark as preparing immediately to prevent re-admission in case of re-entrant scheduler calls
+      item.status = FilePreparationStatus.preparing;
+      _activeWorkerJobIds.add(item.jobId);
+      admittedCount++;
+
+      debugPrint('[FluxShare-Diag] [B3:Admission] admitting jobId=${item.jobId}, file=${item.info.name}');
+
+      _processItem(item).whenComplete(() {
         if (mounted) {
           _runPreparationWorkers();
         }
       });
     }
+
+    final afterActive = _activeWorkerJobIds.length;
+    debugPrint('[FluxShare-Diag] [B3:Admission] beforeActive=$beforeActive, admitted=$admittedCount, afterActive=$afterActive, availableSlots=$availableSlots');
   }
 
   Future<void> _processItem(PickedFileItem targetItem) async {
     final int activeJobId = targetItem.jobId;
+    String outcome = 'unknown';
+
+    debugPrint('[FluxShare-Diag] [B4:ProcessItem] entering: jobId=$activeJobId, file=${targetItem.info.name}');
 
     try {
       if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
@@ -705,7 +788,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
         _manifestUpdateNotifier.value++;
       }
 
+      if (targetItem.isCancelled || targetItem.jobId != activeJobId) {
+        outcome = 'cancelled_before_start';
+        return;
+      }
+
       if (!await targetItem.file.exists()) {
+        outcome = 'error_file_not_found';
         if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
           setState(() {
             targetItem.status = FilePreparationStatus.error;
@@ -721,6 +810,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
           targetItem.status = FilePreparationStatus.hashing;
         });
         _manifestUpdateNotifier.value++;
+        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, from=preparing, to=hashing');
       }
 
       final manifest = await ManifestService.generateManifest(
@@ -728,10 +818,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
         fileId: targetItem.id,
         onProgress: (p) {
           if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
-            setState(() {
-              targetItem.progress = p;
-            });
-            _manifestUpdateNotifier.value++;
+            targetItem.progress = p;
+            targetItem.progressNotifier.value = p;
           }
         },
         isCancelled: () =>
@@ -739,25 +827,45 @@ class _SendFileScreenState extends State<SendFileScreen> {
       );
 
       if (mounted && targetItem.jobId == activeJobId && !targetItem.isCancelled) {
+        outcome = 'success';
         setState(() {
           targetItem.manifest = manifest;
           targetItem.status = FilePreparationStatus.manifestReady;
           targetItem.errorMessage = null;
         });
         _manifestUpdateNotifier.value++;
+        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, from=hashing, to=manifestReady');
+      } else {
+        outcome = 'cancelled_on_completion';
       }
     } catch (e) {
-      if (mounted && targetItem.jobId == activeJobId) {
-        setState(() {
-          if (targetItem.isCancelled) {
+      if (targetItem.isCancelled || (e is FormatException && e.message.contains('cancelled'))) {
+        outcome = 'cancelled';
+        debugPrint('[FluxShare-Diag] [B8:CancelAck] caught cancellation for jobId=$activeJobId, file=${targetItem.info.name}');
+        if (mounted) {
+          setState(() {
             targetItem.status = FilePreparationStatus.cancelled;
-          } else {
+            targetItem.progress = null;
+          });
+          _manifestUpdateNotifier.value++;
+          debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, to=cancelled');
+        }
+      } else {
+        outcome = 'error: $e';
+        debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, error: $e');
+        if (mounted && targetItem.jobId == activeJobId) {
+          setState(() {
             targetItem.status = FilePreparationStatus.error;
             targetItem.errorMessage = e.toString();
-          }
-        });
-        _manifestUpdateNotifier.value++;
+          });
+          _manifestUpdateNotifier.value++;
+        }
       }
+    } finally {
+      // CRITICAL: Always release worker slot regardless of how _processItem exits
+      _activeWorkerJobIds.remove(activeJobId);
+      debugPrint('[FluxShare-Diag] [B9:StateTransition] workerSlotReleased: jobId=$activeJobId, file=${targetItem.info.name}, remainingWorkers=${_activeWorkerJobIds.length}');
+      debugPrint('[FluxShare-Diag] [B10:SchedulerReinvoked] trigger=$outcome, file=${targetItem.info.name}, jobId=$activeJobId');
     }
   }
 
@@ -1335,50 +1443,82 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
           // Status & Progress Area
           if (isHashing) ...[
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
+            ValueListenableBuilder<ManifestProgress?>(
+              valueListenable: item.progressNotifier,
+              builder: (context, p, _) {
+                final progressObj = p ?? item.progress;
+                return Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2.0,
-                        color: AppColors.primaryBlack,
-                      ),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2.0,
+                                color: AppColors.primaryBlack,
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              'Hashing manifest · ${progressObj?.percentage ?? 0}%',
+                              style: const TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.bold,
+                                color: AppColors.primaryBlack,
+                              ),
+                            ),
+                          ],
+                        ),
+                        Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            if (progressObj != null)
+                              Text(
+                                '${progressObj.formattedProcessedBytes} / ${item.info.formattedSize}',
+                                style: const TextStyle(
+                                  fontSize: 11,
+                                  color: AppColors.mediumGray,
+                                ),
+                              ),
+                            const SizedBox(width: 8),
+                            InkWell(
+                              onTap: () => _cancelPreparation(item),
+                              borderRadius: BorderRadius.circular(4),
+                              child: const Padding(
+                                padding: EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                                child: Text(
+                                  'Cancel',
+                                  style: TextStyle(
+                                    fontSize: 11,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.redAccent,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ],
                     ),
-                    const SizedBox(width: 8),
-                    Text(
-                      'Hashing manifest · ${item.progress?.percentage ?? 0}%',
-                      style: const TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.bold,
-                        color: AppColors.primaryBlack,
+                    const SizedBox(height: 6),
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(3),
+                      child: LinearProgressIndicator(
+                        value: progressObj?.progress,
+                        backgroundColor: AppColors.lightGray,
+                        valueColor: const AlwaysStoppedAnimation(AppColors.primaryBlack),
+                        minHeight: 4,
                       ),
                     ),
                   ],
-                ),
-                if (item.progress != null)
-                  Text(
-                    '${item.progress!.formattedProcessedBytes} / ${item.info.formattedSize}',
-                    style: const TextStyle(
-                      fontSize: 11,
-                      color: AppColors.mediumGray,
-                    ),
-                  ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: item.progress?.progress,
-                backgroundColor: AppColors.lightGray,
-                valueColor: const AlwaysStoppedAnimation(AppColors.primaryBlack),
-                minHeight: 4,
-              ),
+                );
+              },
             ),
           ] else if (isReady) ...[
             Row(
@@ -1433,6 +1573,27 @@ class _SendFileScreenState extends State<SendFileScreen> {
                 TextButton(
                   onPressed: () => _retryPreparation(item),
                   child: const Text('Retry', style: TextStyle(fontSize: 11)),
+                ),
+              ],
+            ),
+          ] else if (item.status == FilePreparationStatus.cancelled) ...[
+            Row(
+              children: [
+                const Icon(Icons.cancel_outlined, size: 16, color: Colors.orange),
+                const SizedBox(width: 6),
+                const Expanded(
+                  child: Text(
+                    'Preparation cancelled',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      color: Colors.orange,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => _retryPreparation(item),
+                  child: const Text('Prepare', style: TextStyle(fontSize: 11)),
                 ),
               ],
             ),

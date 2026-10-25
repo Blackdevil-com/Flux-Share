@@ -115,6 +115,7 @@ class FileInfo {
     final name = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
     final length = await file.length();
     final ext = name.contains('.') ? name.split('.').last.toLowerCase() : '';
+
     final formatted = formatBytes(length);
     final type = detectFileType(ext);
 

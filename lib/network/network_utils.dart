@@ -90,4 +90,34 @@ class NetworkUtils {
       client.close();
     }
   }
+
+  /// Pings an address using raw socket to check reachability.
+  static Future<bool> isHostReachable(String host, int port, {Duration timeout = const Duration(seconds: 2)}) async {
+    try {
+      final socket = await Socket.connect(host, port, timeout: timeout);
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Checks if given IP string is a valid private IPv4 range.
+  static bool isPrivateIp(String ip) {
+    try {
+      final parts = ip.split('.').map(int.parse).toList();
+      if (parts.length != 4) return false;
+
+      // 10.0.0.0/8
+      if (parts[0] == 10) return true;
+      // 172.16.0.0/12
+      if (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+      // 192.168.0.0/16
+      if (parts[0] == 192 && parts[1] == 168) return true;
+
+      return false;
+    } catch (_) {
+      return false;
+    }
+  }
 }

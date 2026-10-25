@@ -5,6 +5,7 @@ import 'package:crypto/crypto.dart';
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 import '../models/chunk.dart';
+import '../models/file_info.dart';
 import '../models/manifest.dart';
 import 'file_hasher.dart';
 import 'manifest_cache.dart';
@@ -32,32 +33,23 @@ class ManifestProgress {
   final int currentChunk;
   final int totalChunks;
 
-  const ManifestProgress({
+  ManifestProgress({
     required this.fileId,
     required this.fileName,
     required this.bytesProcessed,
     required this.totalBytes,
     required this.progress,
     required this.stage,
-    this.currentChunk = 0,
-    this.totalChunks = 0,
+    required this.currentChunk,
+    required this.totalChunks,
   });
 
-  String get formattedProcessedBytes => _formatBytes(bytesProcessed);
-  String get formattedTotalBytes => _formatBytes(totalBytes);
   int get percentage => (progress * 100).clamp(0, 100).toInt();
-
-  static String _formatBytes(int bytes) {
-    if (bytes < 1024) return '$bytes B';
-    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    }
-    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-  }
+  String get formattedProcessedBytes => FileInfo.formatBytes(bytesProcessed);
+  String get formattedTotalBytes => FileInfo.formatBytes(totalBytes);
 }
 
-/// Service for generating Manifests with adaptive chunk sizing, cryptographic hashing,
+/// Service for generating Manifests with adaptive chunk sizing, single-pass streaming,
 /// background isolate execution, and persistent manifest caching.
 class ManifestService {
   static const int defaultChunkSize = 1024 * 1024; // 1 MB fallback
@@ -98,15 +90,31 @@ class ManifestService {
     }
 
     final fileSize = await file.length();
-    final fileName = file.uri.pathSegments.last;
+    final fileName = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
     final id = fileId ?? _uuid.v4();
+
+    if (isCancelled?.call() == true) {
+      throw const FormatException('Manifest generation cancelled');
+    }
 
     // Select adaptive chunk size if not explicitly specified
     final effectiveChunkSize = chunkSize ?? selectAdaptiveChunkSize(fileSize);
     final totalChunks = fileSize == 0 ? 0 : (fileSize / effectiveChunkSize).ceil();
 
     // 1. Check verifiable manifest cache first (instant hit for unmodified files)
-    final cached = await ManifestCache.instance.get(file, expectedChunkSize: effectiveChunkSize);
+    debugPrint('[FluxShare-Diag] [B5:CacheLookup] begin: fileId=$id, file=$fileName');
+    Manifest? cached;
+    try {
+      cached = await ManifestCache.instance.get(file, expectedChunkSize: effectiveChunkSize);
+      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=${cached != null ? "hit" : "miss"}');
+    } catch (e) {
+      debugPrint('[FluxShare-Diag] [B5:CacheLookup] end: fileId=$id, file=$fileName, result=error: $e');
+    }
+
+    if (isCancelled?.call() == true) {
+      throw const FormatException('Manifest generation cancelled');
+    }
+
     if (cached != null) {
       onProgress?.call(ManifestProgress(
         fileId: id,
@@ -141,8 +149,35 @@ class ManifestService {
       totalChunks: totalChunks,
     ));
 
+    // Handle empty file (0 bytes) directly
+    if (fileSize == 0) {
+      final emptyManifest = Manifest(
+        fileId: id,
+        fileName: fileName,
+        fileSize: 0,
+        mimeType: detectMimeType(fileName),
+        chunkSize: effectiveChunkSize,
+        chunkCount: 0,
+        fileSha256: sha256.convert(const []).toString(),
+        chunks: const [],
+      );
+      await ManifestCache.instance.put(file, emptyManifest);
+      onProgress?.call(ManifestProgress(
+        fileId: id,
+        fileName: fileName,
+        bytesProcessed: 0,
+        totalBytes: 0,
+        progress: 1.0,
+        stage: 'Manifest Ready',
+        currentChunk: 0,
+        totalChunks: 0,
+      ));
+      return emptyManifest;
+    }
+
+    debugPrint('[FluxShare-Diag] [B6:GenBegin] fileId=$id, file=$fileName, totalBytes=$fileSize, chunkSize=$effectiveChunkSize, totalChunks=$totalChunks');
+
     // 2. Offload hashing to background isolate to keep Flutter UI buttery smooth
-    // If isolates are disabled for test environments, run in-process streaming
     if (disableIsolatesForTesting) {
       final manifest = await _hashInProcess(
         file: file,
@@ -154,6 +189,9 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
       await ManifestCache.instance.put(file, manifest);
       return manifest;
     }
@@ -169,6 +207,10 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
 
       // Persist in verifiable cache
       await ManifestCache.instance.put(file, manifest);
@@ -186,6 +228,9 @@ class ManifestService {
         onProgress: onProgress,
         isCancelled: isCancelled,
       );
+      if (isCancelled?.call() == true) {
+        throw const FormatException('Manifest generation cancelled');
+      }
       await ManifestCache.instance.put(file, manifest);
       return manifest;
     }
@@ -207,22 +252,25 @@ class ManifestService {
     final isolate = await Isolate.spawn(
       _isolateHashingWorker,
       [filePath, fileId, effectiveChunkSize, receivePort.sendPort],
+      onError: receivePort.sendPort,
       debugName: 'FluxShareManifestWorker',
     );
+    debugPrint('[FluxShare-Diag] [B7:Isolate] started: fileId=$fileId, file=$fileName');
 
     StreamSubscription? sub;
-    Timer? cancellationPoller;
+    Timer? poller;
 
     void cleanup() {
-      cancellationPoller?.cancel();
+      poller?.cancel();
       sub?.cancel();
       receivePort.close();
       isolate.kill(priority: Isolate.immediate);
     }
 
     if (isCancelled != null) {
-      cancellationPoller = Timer.periodic(const Duration(milliseconds: 50), (_) {
+      poller = Timer.periodic(const Duration(milliseconds: 30), (_) {
         if (isCancelled()) {
+          debugPrint('[FluxShare-Diag] [B8:CancelAck] poller detected cancel: fileId=$fileId, file=$fileName');
           cleanup();
           if (!completer.isCompleted) {
             completer.completeError(const FormatException('Manifest generation cancelled'));
@@ -232,10 +280,20 @@ class ManifestService {
     }
 
     sub = receivePort.listen((message) {
+      if (message is List && message.length >= 2) {
+        final err = message[0].toString();
+        debugPrint('[FluxShare-Diag] [B7:Isolate] uncaught error: fileId=$fileId, file=$fileName, error=$err');
+        cleanup();
+        if (!completer.isCompleted) {
+          completer.completeError(Exception(err));
+        }
+        return;
+      }
       if (message is Map<String, dynamic>) {
         final type = message['type'] as String;
         if (type == 'progress') {
           if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] progress listener detected cancel: fileId=$fileId, file=$fileName');
             cleanup();
             if (!completer.isCompleted) {
               completer.completeError(const FormatException('Manifest generation cancelled'));
@@ -245,6 +303,7 @@ class ManifestService {
           final offset = message['offset'] as int;
           final chunkId = message['chunkId'] as int;
           final progress = fileSize > 0 ? (offset / fileSize).clamp(0.0, 1.0) : 1.0;
+          debugPrint('[FluxShare-Diag] [B7:Isolate] progress: fileId=$fileId, file=$fileName, bytes=$offset/$fileSize, progress=${(progress * 100).toStringAsFixed(1)}%');
           onProgress?.call(ManifestProgress(
             fileId: fileId,
             fileName: fileName,
@@ -255,15 +314,33 @@ class ManifestService {
             currentChunk: chunkId,
             totalChunks: totalChunks,
           ));
+          if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] progress callback detected cancel: fileId=$fileId, file=$fileName');
+            cleanup();
+            if (!completer.isCompleted) {
+              completer.completeError(const FormatException('Manifest generation cancelled'));
+            }
+            return;
+          }
         } else if (type == 'done') {
+          if (isCancelled?.call() == true) {
+            debugPrint('[FluxShare-Diag] [B8:CancelAck] done discarded due to cancel: fileId=$fileId, file=$fileName');
+            cleanup();
+            if (!completer.isCompleted) {
+              completer.completeError(const FormatException('Manifest generation cancelled'));
+            }
+            return;
+          }
           final manifestJson = message['manifest'] as Map<String, dynamic>;
           final manifest = Manifest.fromJson(manifestJson);
+          debugPrint('[FluxShare-Diag] [B7:Isolate] complete: fileId=$fileId, file=$fileName');
           cleanup();
           if (!completer.isCompleted) {
             completer.complete(manifest);
           }
         } else if (type == 'error') {
           final error = message['error'] as String;
+          debugPrint('[FluxShare-Diag] [B7:Isolate] fail: fileId=$fileId, file=$fileName, error=$error');
           cleanup();
           if (!completer.isCompleted) {
             completer.completeError(Exception(error));
@@ -287,10 +364,11 @@ class ManifestService {
       return;
     }
 
+    RandomAccessFile? raf;
     try {
       final fileSize = await file.length();
-      final fileName = file.uri.pathSegments.last;
-      final raf = await file.open(mode: FileMode.read);
+      final fileName = file.uri.pathSegments.isNotEmpty ? file.uri.pathSegments.last : 'file';
+      raf = await file.open(mode: FileMode.read);
 
       final List<ChunkMeta> chunks = [];
       final sink = _DigestSink();
@@ -298,40 +376,48 @@ class ManifestService {
 
       int chunkId = 0;
       int offset = 0;
+      int lastReportedMs = 0;
+      final sw = Stopwatch()..start();
 
-      try {
-        while (offset < fileSize) {
-          final length = (offset + effectiveChunkSize <= fileSize)
-              ? effectiveChunkSize
-              : (fileSize - offset);
+      while (offset < fileSize) {
+        final length = (offset + effectiveChunkSize <= fileSize)
+            ? effectiveChunkSize
+            : (fileSize - offset);
 
-          await raf.setPosition(offset);
-          final bytes = await raf.read(length);
+        final bytes = await raf.read(length);
 
-          wholeFileConversion.add(bytes);
-          final chunkSha256 = FileHasher.computeBytesSha256(bytes);
+        wholeFileConversion.add(bytes);
+        final chunkSha256 = FileHasher.computeBytesSha256(bytes);
 
-          chunks.add(ChunkMeta(
-            chunkId: chunkId,
-            offset: offset,
-            length: length,
-            sha256: chunkSha256,
-          ));
+        chunks.add(ChunkMeta(
+          chunkId: chunkId,
+          offset: offset,
+          length: length,
+          sha256: chunkSha256,
+        ));
 
-          chunkId++;
-          offset += length;
+        chunkId++;
+        offset += length;
 
+        // Throttle progress updates to at most once every 50ms for production chunks (>= 512 KB),
+        // or emit on every chunk for fine-grained chunking / tests.
+        final nowMs = sw.elapsedMilliseconds;
+        final shouldReport = effectiveChunkSize < 512 * 1024 ||
+            (nowMs - lastReportedMs >= 50) ||
+            offset >= fileSize;
+        if (shouldReport) {
+          lastReportedMs = nowMs;
           sendPort.send({
             'type': 'progress',
             'offset': offset,
             'chunkId': chunkId,
           });
         }
-
-        wholeFileConversion.close();
-      } finally {
-        await raf.close();
       }
+
+      wholeFileConversion.close();
+      await raf.close();
+      raf = null;
 
       final fileSha256 = sink.digest != null
           ? sink.digest.toString()
@@ -356,6 +442,10 @@ class ManifestService {
       });
     } catch (e) {
       sendPort.send({'type': 'error', 'error': e.toString()});
+    } finally {
+      try {
+        await raf?.close();
+      } catch (_) {}
     }
   }
 
@@ -372,9 +462,10 @@ class ManifestService {
     final List<ChunkMeta> chunks = [];
     final sink = _DigestSink();
     final wholeFileConversion = sha256.startChunkedConversion(sink);
-    final raf = await file.open(mode: FileMode.read);
+    RandomAccessFile? raf;
 
     try {
+      raf = await file.open(mode: FileMode.read);
       int chunkId = 0;
       int offset = 0;
 
@@ -387,7 +478,6 @@ class ManifestService {
             ? effectiveChunkSize
             : (fileSize - offset);
 
-        await raf.setPosition(offset);
         final bytes = await raf.read(length);
 
         wholeFileConversion.add(bytes);
@@ -415,12 +505,20 @@ class ManifestService {
           totalChunks: totalChunks,
         ));
 
+        if (isCancelled?.call() == true) {
+          throw const FormatException('Manifest generation cancelled');
+        }
+
         await Future<void>.value();
       }
 
       wholeFileConversion.close();
-    } finally {
       await raf.close();
+      raf = null;
+    } finally {
+      try {
+        await raf?.close();
+      } catch (_) {}
     }
 
     final fileSha256 = sink.digest != null
@@ -429,7 +527,7 @@ class ManifestService {
 
     final mimeType = detectMimeType(fileName);
 
-    return Manifest(
+    final manifest = Manifest(
       fileId: fileId,
       fileName: fileName,
       fileSize: fileSize,
@@ -439,9 +537,11 @@ class ManifestService {
       fileSha256: fileSha256,
       chunks: chunks,
     );
+
+    return manifest;
   }
 
-  /// Alias for generateManifest
+  /// Alias for backward compatibility
   static Future<Manifest> createManifest(
     File file, {
     int? chunkSize,
@@ -458,7 +558,7 @@ class ManifestService {
       );
 
   static String detectMimeType(String fileName) {
-    final ext = fileName.split('.').last.toLowerCase();
+    final ext = fileName.contains('.') ? fileName.split('.').last.toLowerCase() : '';
     switch (ext) {
       case 'jpg':
       case 'jpeg':
@@ -468,9 +568,6 @@ class ManifestService {
       case 'webp':
         return 'image/webp';
       case 'mp4':
-      case 'mkv':
-      case 'avi':
-      case 'mov':
         return 'video/mp4';
       case 'pdf':
         return 'application/pdf';
@@ -481,16 +578,7 @@ class ManifestService {
       case 'json':
         return 'application/json';
       case 'zip':
-      case 'rar':
-      case '7z':
-      case 'tar':
-      case 'gz':
         return 'application/zip';
-      case 'mp3':
-      case 'wav':
-      case 'm4a':
-      case 'flac':
-        return 'audio/mpeg';
       default:
         return 'application/octet-stream';
     }
