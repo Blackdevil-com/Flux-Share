@@ -19,9 +19,11 @@ void main() {
   tearDown(() async {
     FilePickerService.customPayloadPickerHandler = null;
     FilePickerService.customMultiplePickerHandler = null;
-    if (await tempDir.exists()) {
-      await tempDir.delete(recursive: true);
-    }
+    try {
+      if (await tempDir.exists()) {
+        await tempDir.delete(recursive: true);
+      }
+    } catch (_) {}
   });
 
   group('Single-Pass Manifest Generation & Progress Reporting Tests', () {

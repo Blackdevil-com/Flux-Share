@@ -78,6 +78,8 @@ class FilePickerService {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: false,
         type: FileType.any,
+        withData: false,
+        withReadStream: true,
       );
       if (result == null || result.files.isEmpty) {
         debugPrint('[FluxShare] Single picker cancelled or returned no file.');
@@ -88,6 +90,13 @@ class FilePickerService {
       File? resolvedFile;
       if (f.path != null && f.path!.isNotEmpty) {
         resolvedFile = File(f.path!);
+      } else if (f.readStream != null) {
+        final tempDir = Directory.systemTemp;
+        final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
+        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
+        final sink = resolvedFile.openWrite();
+        await f.readStream!.pipe(sink);
+        debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
       } else if (f.bytes != null) {
         final tempDir = Directory.systemTemp;
         final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
@@ -98,10 +107,16 @@ class FilePickerService {
 
       if (resolvedFile != null) {
         final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
+        int size = f.size;
+        if (size <= 0 && resolvedFile.existsSync()) {
+          try {
+            size = resolvedFile.lengthSync();
+          } catch (_) {}
+        }
         return SelectedFilePayload(
           file: resolvedFile,
           name: f.name,
-          sizeBytes: f.size,
+          sizeBytes: size,
           extension: ext,
           type: fi.FileInfo.detectFileType(ext),
         );
@@ -151,6 +166,8 @@ class FilePickerService {
       final result = await FilePicker.platform.pickFiles(
         allowMultiple: true,
         type: FileType.any,
+        withData: false,
+        withReadStream: true,
       );
 
       if (result == null) {
@@ -163,6 +180,13 @@ class FilePickerService {
         File? resolvedFile;
         if (f.path != null && f.path!.isNotEmpty) {
           resolvedFile = File(f.path!);
+        } else if (f.readStream != null) {
+          final tempDir = Directory.systemTemp;
+          final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
+          resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
+          final sink = resolvedFile.openWrite();
+          await f.readStream!.pipe(sink);
+          debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
         } else if (f.bytes != null) {
           final tempDir = Directory.systemTemp;
           final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
@@ -173,10 +197,16 @@ class FilePickerService {
 
         if (resolvedFile != null) {
           final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
+          int size = f.size;
+          if (size <= 0 && resolvedFile.existsSync()) {
+            try {
+              size = resolvedFile.lengthSync();
+            } catch (_) {}
+          }
           payloads.add(SelectedFilePayload(
             file: resolvedFile,
             name: f.name,
-            sizeBytes: f.size,
+            sizeBytes: size,
             extension: ext,
             type: fi.FileInfo.detectFileType(ext),
           ));

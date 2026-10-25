@@ -145,7 +145,7 @@ void main() {
 
       // Invalidate old job
       targetItem.isCancelled = true;
-      final newJobId = ++targetItem.jobId;
+      expect(++targetItem.jobId, equals(oldJobId + 1));
 
       final replacement = await FilePickerService.pickSingleFilePayload();
       expect(replacement, isNotNull);
@@ -202,7 +202,7 @@ void main() {
 
       // User cancels preparation
       item.isCancelled = true;
-      final activeJobId = ++item.jobId;
+      expect(++item.jobId, equals(11));
       item.status = FilePreparationStatus.cancelled;
 
       // Simulate a late callback finishing from the old job (jobId: 10)
@@ -362,7 +362,7 @@ void main() {
     });
 
     test('12. Batch status summary formats correctly for 4 files', () {
-      final summary = '4 files · 2 ready · 1 preparing · 1 queued';
+      const summary = '4 files · 2 ready · 1 preparing · 1 queued';
       expect(summary, contains('2 ready'));
       expect(summary, contains('1 preparing'));
       expect(summary, contains('1 queued'));
