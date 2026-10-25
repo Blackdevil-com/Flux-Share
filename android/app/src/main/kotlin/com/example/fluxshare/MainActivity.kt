@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.net.wifi.WifiManager
 import android.os.Build
 import androidx.annotation.NonNull
 import io.flutter.embedding.android.FlutterActivity
@@ -14,10 +15,13 @@ class MainActivity : FlutterActivity() {
 
     companion object {
         const val CHANNEL = "com.example.fluxshare/background_service"
+        const val MULTICAST_CHANNEL = "com.fluxshare/multicast_lock"
     }
 
     private var methodChannel: MethodChannel? = null
     private var cancelReceiver: BroadcastReceiver? = null
+    private var multicastLock: WifiManager.MulticastLock? = null
+    private var wifiLock: WifiManager.WifiLock? = null
 
     override fun configureFlutterEngine(@NonNull flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -96,6 +100,56 @@ class MainActivity : FlutterActivity() {
             }
         }
 
+        // MulticastLock and WifiLock Channel for reliable UDP discovery & Hotspot transfers
+        MethodChannel(flutterEngine.dartExecutor.binaryMessenger, MULTICAST_CHANNEL).apply {
+            setMethodCallHandler { call, result ->
+                when (call.method) {
+                    "acquireMulticastLock" -> {
+                        try {
+                            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+                            if (multicastLock == null) {
+                                multicastLock = wifiManager?.createMulticastLock("FluxShareMulticastLock")?.apply {
+                                    setReferenceCounted(true)
+                                }
+                            }
+                            if (multicastLock?.isHeld != true) {
+                                multicastLock?.acquire()
+                            }
+                            if (wifiLock == null) {
+                                wifiLock = wifiManager?.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "FluxShareWifiLock")?.apply {
+                                    setReferenceCounted(true)
+                                }
+                            }
+                            if (wifiLock?.isHeld != true) {
+                                wifiLock?.acquire()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("LOCK_ACQUIRE_FAILED", e.message, null)
+                        }
+                    }
+
+                    "releaseMulticastLock" -> {
+                        try {
+                            if (multicastLock?.isHeld == true) {
+                                multicastLock?.release()
+                            }
+                            if (wifiLock?.isHeld == true) {
+                                wifiLock?.release()
+                            }
+                            result.success(true)
+                        } catch (e: Exception) {
+                            result.error("LOCK_RELEASE_FAILED", e.message, null)
+                        }
+                    }
+
+                    else -> {
+                        result.notImplemented()
+                    }
+                }
+            }
+        }
+
         // Register receiver for cancel action from ongoing notification
         cancelReceiver = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
@@ -114,6 +168,19 @@ class MainActivity : FlutterActivity() {
     }
 
     override fun onDestroy() {
+        try {
+            if (multicastLock?.isHeld == true) {
+                multicastLock?.release()
+            }
+            multicastLock = null
+            if (wifiLock?.isHeld == true) {
+                wifiLock?.release()
+            }
+            wifiLock = null
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
         cancelReceiver?.let {
             try {
                 unregisterReceiver(it)

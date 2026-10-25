@@ -7,6 +7,7 @@ import '../../discovery/discovery_service.dart';
 import '../../file/filename_sanitizer.dart';
 import '../../models/models.dart';
 import '../../network/http_client.dart';
+import '../../network/network_utils.dart';
 import '../../network/local_server.dart';
 import '../../network/websocket_service.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
@@ -77,24 +78,62 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
 
     try {
       final discoveryService = DiscoveryService();
-      final room = await discoveryService.discoverRoomByPin(pin: pin);
+      final discoveryResult = await discoveryService.discoverRoomResult(pin: pin);
 
-      if (room == null) {
+      if (discoveryResult is! DiscoverRoomSuccess) {
         if (mounted) {
           setState(() {
             _isConnecting = false;
           });
+          final message = discoveryResult is DiscoverRoomTimeout
+              ? 'Could not find host with PIN $pin. Ensure both devices are on the same Wi-Fi or Hotspot.'
+              : 'Discovery error: ${(discoveryResult as DiscoverRoomFailure).reason}';
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Could not find host with PIN $pin. Ensure both devices are on the same Wi-Fi.'),
+              content: Text(message),
               backgroundColor: AppColors.primaryBlack,
+              action: SnackBarAction(
+                label: 'Direct IP',
+                textColor: AppColors.backgroundWhite,
+                onPressed: _showDirectConnectDialog,
+              ),
+              duration: const Duration(seconds: 6),
             ),
           );
         }
         return;
       }
 
+      final room = discoveryResult.room;
       final httpClient = P2PHttpClient();
+
+      // Health check before downloading manifests
+      final health = await httpClient.checkHealth(room.ip, room.port);
+      if (health is! HealthCheckSuccess) {
+        httpClient.close();
+        if (mounted) {
+          setState(() {
+            _isConnecting = false;
+          });
+          final errorMsg = health is HealthCheckUnreachable
+              ? 'Discovered host at ${room.ip}:${room.port}, but HTTP connection failed. Hotspot client isolation may be blocking device-to-device traffic.'
+              : 'Host health error: ${(health as HealthCheckFailure).message}';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMsg),
+              backgroundColor: AppColors.primaryBlack,
+              action: SnackBarAction(
+                label: 'Direct IP',
+                textColor: AppColors.backgroundWhite,
+                onPressed: _showDirectConnectDialog,
+              ),
+              duration: const Duration(seconds: 6),
+            ),
+          );
+        }
+        return;
+      }
+
       BatchManifestFetchResult result;
       try {
         result = await httpClient.downloadBatchManifest(room.ip, room.port);
@@ -162,6 +201,26 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
   }
 
   void _joinRoomDirect(String ip, int port) async {
+    final cleanIp = ip.trim();
+    if (!NetworkUtils.isValidIpv4(cleanIp)) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Invalid IPv4 address format. Example: 192.168.43.1'),
+          backgroundColor: AppColors.primaryBlack,
+        ),
+      );
+      return;
+    }
+    if (port <= 0 || port > 65535) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Invalid port number. Must be between 1 and 65535'),
+          backgroundColor: AppColors.primaryBlack,
+        ),
+      );
+      return;
+    }
+
     FocusScope.of(context).unfocus();
     setState(() {
       _isConnecting = true;
@@ -169,9 +228,30 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
 
     try {
       final httpClient = P2PHttpClient();
+
+      // Health check before downloading manifests
+      final health = await httpClient.checkHealth(cleanIp, port);
+      if (health is! HealthCheckSuccess) {
+        httpClient.close();
+        if (mounted) {
+          setState(() => _isConnecting = false);
+          final errorMsg = health is HealthCheckUnreachable
+              ? 'Could not connect to host at $cleanIp:$port. Ensure both devices are on the same Wi-Fi/Hotspot without client isolation.'
+              : 'Host error: ${(health as HealthCheckFailure).message}';
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(errorMsg),
+              backgroundColor: AppColors.primaryBlack,
+              duration: const Duration(seconds: 6),
+            ),
+          );
+        }
+        return;
+      }
+
       BatchManifestFetchResult result;
       try {
-        result = await httpClient.downloadBatchManifest(ip, port);
+        result = await httpClient.downloadBatchManifest(cleanIp, port);
       } finally {
         httpClient.close();
       }
@@ -181,10 +261,10 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
         final firstManifest = batch.manifests.isNotEmpty ? batch.manifests.first : null;
         final room = DiscoveredRoom(
           roomId: batch.batchId,
-          ip: ip,
+          ip: cleanIp,
           port: port,
           pin: 'DIRECT',
-          deviceName: 'Direct Host ($ip)',
+          deviceName: 'Direct Host ($cleanIp)',
         );
         _currentBatchManifest = batch;
         _currentManifest = firstManifest;
@@ -211,7 +291,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
             _manifestReceived = true;
             _connectedPin = 'DIRECT';
             _incomingFile = fileInfo;
-            _senderName = 'Direct Host ($ip)';
+            _senderName = 'Direct Host ($cleanIp)';
           });
         }
       } else if (result is BatchManifestFetchError) {
@@ -219,7 +299,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
           setState(() => _isConnecting = false);
           ScaffoldMessenger.of(context).showSnackBar(
             SnackBar(
-              content: Text('Failed to connect to host: ${result.message}'),
+              content: Text('Failed to download manifest: ${result.message}'),
               backgroundColor: AppColors.primaryBlack,
             ),
           );
@@ -238,8 +318,18 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
     }
   }
 
-  void _showDirectConnectDialog() {
-    final ipController = TextEditingController(text: '192.168.43.1');
+  void _showDirectConnectDialog() async {
+    final localIp = await NetworkUtils.getLocalIpAddress();
+    String defaultHost = '192.168.43.1';
+    if (localIp != null && localIp.contains('.')) {
+      final parts = localIp.split('.');
+      if (parts.length == 4) {
+        defaultHost = '${parts[0]}.${parts[1]}.${parts[2]}.1';
+      }
+    }
+
+    if (!mounted) return;
+    final ipController = TextEditingController(text: defaultHost);
     final portController = TextEditingController(text: '8080');
 
     showDialog(
@@ -256,7 +346,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'If UDP broadcast is blocked by hotspot client isolation, connect directly via the host IP address and port.',
+              'If UDP broadcast is blocked by hotspot client isolation, connect directly via the host IP address and HTTP port. Both devices must be on the same local network.',
               style: TextStyle(fontSize: 12, color: AppColors.mediumGray),
             ),
             const SizedBox(height: 16),

@@ -966,12 +966,26 @@ class _SendFileScreenState extends State<SendFileScreen> {
       final port = await server.start();
       server.setBatchManifests(batchItems);
 
-      await _discoveryService.startRoomHost(
+      final hostResult = await _discoveryService.startRoomHost(
         pin: _roomPin,
         roomId: batchManifest.batchId,
         serverPort: port,
         deviceName: server.localDeviceName,
       );
+
+      if (hostResult is RoomHostStartFailure) {
+        debugPrint('[FluxShare-Network] [Host] Discovery listener failed: ${hostResult.reason}');
+        final localIp = await NetworkUtils.getLocalIpAddress() ?? '0.0.0.0';
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Room created, but UDP discovery listener failed to bind. Receivers can join using Direct IP: $localIp:$port'),
+              backgroundColor: AppColors.primaryBlack,
+              duration: const Duration(seconds: 6),
+            ),
+          );
+        }
+      }
 
       RoomManager().createRoom(
         hostPeerId: server.localPeerId,

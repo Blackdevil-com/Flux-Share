@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
+import 'package:flutter/foundation.dart';
 import '../models/batch_manifest.dart';
 import '../models/chunk.dart';
 import '../models/manifest.dart';
@@ -12,6 +13,35 @@ class _DigestAccumulator implements Sink<Digest> {
   void add(Digest data) => value = data;
   @override
   void close() {}
+}
+
+sealed class HealthCheckResult {}
+
+class HealthCheckSuccess extends HealthCheckResult {
+  final String peerId;
+  final String deviceName;
+  final String platform;
+  final String version;
+  HealthCheckSuccess({
+    required this.peerId,
+    required this.deviceName,
+    required this.platform,
+    required this.version,
+  });
+}
+
+class HealthCheckFailure extends HealthCheckResult {
+  final int statusCode;
+  final String message;
+  final String url;
+  HealthCheckFailure({required this.statusCode, required this.message, required this.url});
+}
+
+class HealthCheckUnreachable extends HealthCheckResult {
+  final String message;
+  final String url;
+  final Object? error;
+  HealthCheckUnreachable({required this.message, required this.url, this.error});
 }
 
 sealed class ManifestFetchResult {}
@@ -42,12 +72,54 @@ class BatchManifestFetchError extends BatchManifestFetchResult {
   BatchManifestFetchError({required this.statusCode, required this.message, required this.url});
 }
 
-/// HTTP Client for manifest and chunk downloads.
+/// HTTP Client for health checks, manifest retrieval, and chunk downloads.
 class P2PHttpClient {
   final HttpClient _client = HttpClient()
     ..connectionTimeout = const Duration(seconds: 10)
     ..idleTimeout = const Duration(seconds: 30)
     ..maxConnectionsPerHost = 10;
+
+  /// Performs bounded HTTP GET /health check to verify the host is reachable and running FluxShare.
+  Future<HealthCheckResult> checkHealth(
+    String peerIp,
+    int peerPort, {
+    Duration timeout = const Duration(seconds: 3),
+  }) async {
+    final url = 'http://$peerIp:$peerPort/health';
+    try {
+      debugPrint('[FluxShare-Network] [HealthCheck] Pinging $url (timeout: ${timeout.inSeconds}s)');
+      final request = await _client.getUrl(Uri.parse(url)).timeout(timeout);
+      final response = await request.close().timeout(timeout);
+
+      if (response.statusCode == HttpStatus.ok) {
+        final body = await response.transform(utf8.decoder).join();
+        final json = jsonDecode(body) as Map<String, dynamic>;
+        debugPrint(
+            '[FluxShare-Network] [HealthCheck] Success from $url: peerId=${json['peerId']}, device=${json['deviceName']}');
+        return HealthCheckSuccess(
+          peerId: json['peerId'] as String? ?? '',
+          deviceName: json['deviceName'] as String? ?? 'FluxShare Device',
+          platform: json['platform'] as String? ?? 'unknown',
+          version: json['version'] as String? ?? '1.0.0',
+        );
+      } else {
+        final body = await response.transform(utf8.decoder).join();
+        debugPrint('[FluxShare-Network] [HealthCheck] Failed with HTTP ${response.statusCode} from $url');
+        return HealthCheckFailure(
+          statusCode: response.statusCode,
+          message: body.isNotEmpty ? body : 'HTTP ${response.statusCode}',
+          url: url,
+        );
+      }
+    } catch (e) {
+      debugPrint('[FluxShare-Network] [HealthCheck] Host unreachable at $url: $e');
+      return HealthCheckUnreachable(
+        message: 'Could not connect to host at $peerIp:$peerPort: $e',
+        url: url,
+        error: e,
+      );
+    }
+  }
 
   /// Downloads manifest from peer with retries and detailed error reporting.
   Future<ManifestFetchResult> downloadManifest(
@@ -61,12 +133,14 @@ class P2PHttpClient {
 
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        debugPrint('[FluxShare-Network] [ManifestFetch] GET $url (attempt $attempt/$maxRetries)');
         final request = await _client.getUrl(Uri.parse(url));
         final response = await request.close();
 
         if (response.statusCode == HttpStatus.ok) {
           final body = await response.transform(utf8.decoder).join();
           final jsonMap = jsonDecode(body) as Map<String, dynamic>;
+          debugPrint('[FluxShare-Network] [ManifestFetch] Success from $url: ${jsonMap['fileName']} (${jsonMap['fileSize']} bytes)');
           return ManifestFetchSuccess(Manifest.fromJson(jsonMap));
         } else {
           final errorBody = await response.transform(utf8.decoder).join();
@@ -75,6 +149,7 @@ class P2PHttpClient {
             message: errorBody.isNotEmpty ? errorBody : 'HTTP ${response.statusCode}',
             url: url,
           );
+          debugPrint('[FluxShare-Network] [ManifestFetch] HTTP ${response.statusCode} from $url: $errorBody');
         }
       } catch (e) {
         lastResult = ManifestFetchError(
@@ -82,6 +157,7 @@ class P2PHttpClient {
           message: e.toString(),
           url: url,
         );
+        debugPrint('[FluxShare-Network] [ManifestFetch] Error from $url: $e');
       }
 
       if (attempt < maxRetries) {
@@ -103,15 +179,23 @@ class P2PHttpClient {
     final batchUrl = 'http://$peerIp:$peerPort/manifests';
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
       try {
+        debugPrint('[FluxShare-Network] [BatchManifestFetch] GET $batchUrl (attempt $attempt/$maxRetries)');
         final request = await _client.getUrl(Uri.parse(batchUrl));
         final response = await request.close();
 
         if (response.statusCode == HttpStatus.ok) {
           final body = await response.transform(utf8.decoder).join();
           final jsonMap = jsonDecode(body) as Map<String, dynamic>;
-          return BatchManifestFetchSuccess(BatchManifest.fromJson(jsonMap));
+          final batch = BatchManifest.fromJson(jsonMap);
+          debugPrint(
+              '[FluxShare-Network] [BatchManifestFetch] Success: ${batch.totalFiles} files, ${batch.totalBytes} bytes');
+          return BatchManifestFetchSuccess(batch);
+        } else {
+          debugPrint('[FluxShare-Network] [BatchManifestFetch] HTTP ${response.statusCode} from $batchUrl');
         }
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('[FluxShare-Network] [BatchManifestFetch] Error on attempt $attempt: $e');
+      }
 
       if (attempt < maxRetries) {
         await Future.delayed(retryDelay);
@@ -119,6 +203,7 @@ class P2PHttpClient {
     }
 
     // Fallback to single manifest for legacy single-file hosts
+    debugPrint('[FluxShare-Network] [BatchManifestFetch] Falling back to single /manifest endpoint');
     final singleResult = await downloadManifest(peerIp, peerPort, maxRetries: 2);
     if (singleResult is ManifestFetchSuccess) {
       return BatchManifestFetchSuccess(BatchManifest.fromSingleManifest(singleResult.manifest));

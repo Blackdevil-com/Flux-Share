@@ -6,6 +6,7 @@ import '../../ai/ai_service.dart';
 import '../../app/theme.dart';
 import '../../models/models.dart';
 import '../../network/local_server.dart';
+import '../../network/network_utils.dart';
 import '../../repositories/transfer_repository.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
 import '../../transfer/transfer_engine.dart';
@@ -506,14 +507,37 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: AppColors.borderGray),
                         ),
-                        child: Text(
-                          'Room PIN: ${widget.roomPin}',
-                          style: const TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 2.0,
-                            color: AppColors.primaryBlack,
-                          ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              'Room PIN: ${widget.roomPin}',
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 2.0,
+                                color: AppColors.primaryBlack,
+                              ),
+                            ),
+                            if (widget.isHost && LocalServer().isRunning) ...[
+                              const SizedBox(height: 4),
+                              FutureBuilder<String?>(
+                                future: NetworkUtils.getLocalIpAddress(),
+                                builder: (context, snapshot) {
+                                  final ip = snapshot.data ?? '...';
+                                  final port = LocalServer().port;
+                                  return Text(
+                                    'Direct IP: $ip:$port',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                      color: AppColors.mediumGray,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                       const SizedBox(height: AppSpacing.s16),
