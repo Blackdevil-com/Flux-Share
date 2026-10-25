@@ -29,8 +29,17 @@ class LocalServer {
   String localDeviceName = 'FluxShare Device';
   String platform = Platform.isAndroid ? 'android' : (Platform.isIOS ? 'ios' : 'unknown');
 
-  Manifest? currentManifest;
-  File? currentSourceFile;
+  final Map<String, Manifest> _manifests = <String, Manifest>{};
+  final Map<String, File> _sourceFiles = <String, File>{};
+  final Map<String, Set<int>> _verifiedChunksByFile = <String, Set<int>>{};
+
+  String? _primaryFileId;
+  Manifest? get currentManifest =>
+      (_primaryFileId != null ? _manifests[_primaryFileId] : null) ??
+      _manifests.values.firstOrNull;
+  File? get currentSourceFile =>
+      (_primaryFileId != null ? _sourceFiles[_primaryFileId] : null) ??
+      _sourceFiles.values.firstOrNull;
   final Set<int> verifiedChunks = <int>{};
   final Map<String, PeerInfo> knownPeers = <String, PeerInfo>{};
 
@@ -38,21 +47,40 @@ class LocalServer {
   final List<ControlMessageHandler> _controlListeners = [];
 
   void setManifest(Manifest manifest, File file) {
-    currentManifest = manifest;
-    currentSourceFile = file;
+    _primaryFileId = manifest.fileId;
+    _manifests[manifest.fileId] = manifest;
+    _sourceFiles[manifest.fileId] = file;
+    final fileChunks = _verifiedChunksByFile.putIfAbsent(manifest.fileId, () => <int>{});
+    fileChunks.addAll(manifest.chunks.map((c) => c.chunkId));
     verifiedChunks.addAll(manifest.chunks.map((c) => c.chunkId));
   }
 
-  void setVerifiedChunks(Set<int> chunks) {
+  void setBatchManifests(List<({Manifest manifest, File file})> batch) {
+    for (final item in batch) {
+      setManifest(item.manifest, item.file);
+    }
+  }
+
+  void setVerifiedChunks(Set<int> chunks, {String? fileId}) {
+    if (fileId != null) {
+      final fileChunks = _verifiedChunksByFile.putIfAbsent(fileId, () => <int>{});
+      fileChunks.clear();
+      fileChunks.addAll(chunks);
+    }
     verifiedChunks.clear();
     verifiedChunks.addAll(chunks);
   }
 
-  void markChunkAvailable(int chunkId) {
+  void markChunkAvailable(int chunkId, {String? fileId}) {
+    final targetFileId = fileId ?? currentManifest?.fileId;
+    if (targetFileId != null) {
+      _verifiedChunksByFile.putIfAbsent(targetFileId, () => <int>{}).add(chunkId);
+    }
     verifiedChunks.add(chunkId);
     broadcastMessage({
       'type': 'CHUNK_AVAILABLE',
       'peerId': localPeerId,
+      if (targetFileId != null) 'fileId': targetFileId,
       'chunkId': chunkId,
     });
   }
@@ -95,7 +123,7 @@ class LocalServer {
       );
     });
 
-    // 2. GET /manifest
+    // 2a. GET /manifest (single manifest / primary file)
     router.get('/manifest', (Request request) {
       final m = currentManifest;
       if (m != null) {
@@ -111,7 +139,98 @@ class LocalServer {
       }
     });
 
-    // 3. GET /chunk/<chunkId>
+    // 2b. GET /manifests or /batch-manifest (full batch manifest)
+    router.get('/manifests', (Request request) {
+      if (_manifests.isNotEmpty) {
+        final list = _manifests.values.map((m) => m.toJson()).toList();
+        return Response.ok(
+          jsonEncode({
+            'batchId': _manifests.keys.first,
+            'totalFiles': _manifests.length,
+            'totalBytes': _manifests.values.fold(0, (sum, m) => sum + m.fileSize),
+            'manifests': list,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
+      } else {
+        return Response.notFound(
+          jsonEncode({'error': 'MANIFEST_NOT_READY', 'message': 'No manifests available'}),
+          headers: {'content-type': 'application/json'},
+        );
+      }
+    });
+
+    router.get('/batch-manifest', (Request request) {
+      if (_manifests.isNotEmpty) {
+        final list = _manifests.values.map((m) => m.toJson()).toList();
+        return Response.ok(
+          jsonEncode({
+            'batchId': _manifests.keys.first,
+            'totalFiles': _manifests.length,
+            'totalBytes': _manifests.values.fold(0, (sum, m) => sum + m.fileSize),
+            'manifests': list,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
+      } else {
+        return Response.notFound(
+          jsonEncode({'error': 'MANIFEST_NOT_READY', 'message': 'No manifests available'}),
+          headers: {'content-type': 'application/json'},
+        );
+      }
+    });
+
+    // 2c. GET /file/<fileId>/manifest
+    router.get('/file/<fileId>/manifest', (Request request, String fileId) {
+      final m = _manifests[fileId];
+      if (m != null) {
+        return Response.ok(
+          jsonEncode(m.toJson()),
+          headers: {'content-type': 'application/json'},
+        );
+      }
+      return Response.notFound('Manifest for file $fileId not found');
+    });
+
+    // 3a. GET /file/<fileId>/chunk/<chunkId> (Multi-file isolated streaming)
+    router.get('/file/<fileId>/chunk/<chunkId>', (Request request, String fileId, String chunkIdStr) async {
+      final chunkId = int.tryParse(chunkIdStr);
+      if (chunkId == null) {
+        return Response.notFound('Invalid chunk ID');
+      }
+
+      final m = _manifests[fileId];
+      final file = _sourceFiles[fileId];
+      if (m == null || file == null || !await file.exists()) {
+        return Response.notFound('Source file or manifest not available for file $fileId');
+      }
+
+      final fileChunks = _verifiedChunksByFile[fileId] ?? verifiedChunks;
+      if (!fileChunks.contains(chunkId)) {
+        return Response.notFound('Chunk $chunkId for file $fileId not available on this peer');
+      }
+
+      final chunk = m.chunks.firstWhere(
+        (c) => c.chunkId == chunkId,
+        orElse: () => throw Exception('Not found'),
+      );
+
+      try {
+        final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        return Response.ok(
+          stream,
+          headers: {
+            'content-type': 'application/octet-stream',
+            'content-length': '${chunk.length}',
+            'content-disposition': 'attachment; filename="chunk_${fileId}_$chunkId"',
+          },
+        );
+      } catch (e) {
+        return Response.internalServerError(body: 'Error reading chunk: $e');
+      }
+    });
+
+    // 3b. GET /chunk/<chunkId> (Single-file legacy streaming)
     router.get('/chunk/<chunkId>', (Request request, String chunkIdStr) async {
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
@@ -161,6 +280,9 @@ class LocalServer {
         httpPort: _port,
         webSocketPort: _port,
         availableChunks: Set.from(verifiedChunks),
+        availableChunksByFile: Map.from(
+          _verifiedChunksByFile.map((k, v) => MapEntry(k, Set<int>.from(v))),
+        ),
       );
       return Response.ok(
         jsonEncode(info.toJson()),
@@ -172,7 +294,7 @@ class LocalServer {
     router.post('/room/join', (Request request) async {
       final body = await request.readAsString();
       try {
-        final data = jsonDecode(body) as Map<String, dynamic>;
+        jsonDecode(body);
         // Return active room confirmation
         return Response.ok(
           jsonEncode({'status': 'joined', 'peerId': localPeerId, 'fileId': currentManifest?.fileId}),
@@ -245,6 +367,12 @@ class LocalServer {
       } catch (_) {}
     }
     _activeWsClients.clear();
+    _controlListeners.clear();
+    _manifests.clear();
+    _sourceFiles.clear();
+    _verifiedChunksByFile.clear();
+    verifiedChunks.clear();
+    _primaryFileId = null;
     await _server?.close(force: true);
     _server = null;
     _port = 0;

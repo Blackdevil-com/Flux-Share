@@ -259,21 +259,18 @@ class ManifestService {
             currentChunk: chunkId,
             totalChunks: totalChunks,
           ));
+          if (isCancelled?.call() == true) {
+            cleanup();
+            if (!completer.isCompleted) {
+              completer.completeError(const FormatException('Manifest generation cancelled'));
+            }
+            return;
+          }
         } else if (type == 'done') {
           final manifestJson = message['manifest'] as Map<String, dynamic>;
           final manifest = Manifest.fromJson(manifestJson);
           cleanup();
           if (!completer.isCompleted) {
-            onProgress?.call(ManifestProgress(
-              fileId: fileId,
-              fileName: fileName,
-              bytesProcessed: fileSize,
-              totalBytes: fileSize,
-              progress: 1.0,
-              stage: 'Manifest Ready',
-              currentChunk: totalChunks,
-              totalChunks: totalChunks,
-            ));
             completer.complete(manifest);
           }
         } else if (type == 'error') {
@@ -336,9 +333,13 @@ class ManifestService {
         chunkId++;
         offset += length;
 
-        // Throttle progress updates to at most once every 50ms (or on final chunk)
+        // Throttle progress updates to at most once every 50ms for production chunks (>= 512 KB),
+        // or emit on every chunk for fine-grained chunking / tests.
         final nowMs = sw.elapsedMilliseconds;
-        if (nowMs - lastReportedMs >= 50 || offset >= fileSize) {
+        final shouldReport = effectiveChunkSize < 512 * 1024 ||
+            (nowMs - lastReportedMs >= 50) ||
+            offset >= fileSize;
+        if (shouldReport) {
           lastReportedMs = nowMs;
           sendPort.send({
             'type': 'progress',
@@ -438,6 +439,10 @@ class ManifestService {
           totalChunks: totalChunks,
         ));
 
+        if (isCancelled?.call() == true) {
+          throw const FormatException('Manifest generation cancelled');
+        }
+
         await Future<void>.value();
       }
 
@@ -467,17 +472,6 @@ class ManifestService {
       chunks: chunks,
     );
 
-    onProgress?.call(ManifestProgress(
-      fileId: fileId,
-      fileName: fileName,
-      bytesProcessed: fileSize,
-      totalBytes: fileSize,
-      progress: 1.0,
-      stage: 'Manifest Ready',
-      currentChunk: totalChunks,
-      totalChunks: totalChunks,
-    ));
-
     return manifest;
   }
 
@@ -485,12 +479,14 @@ class ManifestService {
   static Future<Manifest> createManifest(
     File file, {
     int? chunkSize,
+    String? fileId,
     void Function(ManifestProgress progress)? onProgress,
     bool Function()? isCancelled,
   }) =>
       generateManifest(
         file,
         chunkSize: chunkSize,
+        fileId: fileId,
         onProgress: onProgress,
         isCancelled: isCancelled,
       );

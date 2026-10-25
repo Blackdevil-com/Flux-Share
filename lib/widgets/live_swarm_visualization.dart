@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import '../app/theme.dart';
 import '../transfer/transfer_engine.dart';
@@ -20,6 +21,35 @@ class LiveSwarmVisualization extends StatefulWidget {
 }
 
 class _LiveSwarmVisualizationState extends State<LiveSwarmVisualization> {
+  StreamSubscription<TransferProgressEvent>? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribe();
+  }
+
+  @override
+  void didUpdateWidget(LiveSwarmVisualization oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.engine != widget.engine) {
+      _sub?.cancel();
+      _subscribe();
+    }
+  }
+
+  void _subscribe() {
+    _sub = widget.engine?.progressStream.listen((_) {
+      if (mounted) setState(() {});
+    });
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     if (widget.engine == null) {

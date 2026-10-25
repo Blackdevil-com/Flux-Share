@@ -71,9 +71,9 @@ fun SendFileScreen(
     val context = LocalContext.current
 
     val filePickerLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetContent()
-    ) { uri ->
-        uri?.let { onFileSelected(context, it) }
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        uris.forEach { onFileSelected(context, it) }
     }
 
     val selectedPeerIds = remember { mutableStateMapOf<String, Boolean>() }

@@ -9,6 +9,7 @@ typedef OnChunkSuccess = void Function(
   int chunkId,
   String sourcePeerId,
   int bytes,
+  Duration chunkDuration,
   Duration? timeToFirstByte,
 );
 typedef OnChunkFailure = void Function(
@@ -23,6 +24,7 @@ typedef SelectWorkCallback = ({ChunkMeta chunk, PeerInfo peer})? Function(String
 /// and guarantees release of chunk reservations on every terminal path.
 class TransferWorker {
   final String workerId;
+  final String? fileId;
   final ReservationManager reservationManager;
   final ChunkWriterSession writerSession;
   final ChunkDownloader downloader;
@@ -36,6 +38,7 @@ class TransferWorker {
 
   TransferWorker({
     required this.workerId,
+    this.fileId,
     required this.reservationManager,
     required this.writerSession,
     required this.downloader,
@@ -105,6 +108,7 @@ class TransferWorker {
           peer: peer,
           chunkMeta: chunk,
           writerSession: writerSession,
+          fileId: fileId,
         );
       } catch (e) {
         result = ChunkDownloadResult(
@@ -127,6 +131,7 @@ class TransferWorker {
           chunk.chunkId,
           peer.peerId,
           result.bytes,
+          result.duration,
           result.timeToFirstByte,
         );
       } else {

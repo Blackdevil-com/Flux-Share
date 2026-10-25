@@ -1,18 +1,22 @@
 import 'dart:io';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 
 /// Network utilities for interface detection, IP resolution, and reachability.
 class NetworkUtils {
+  @visibleForTesting
   static String? customLocalIp;
+
   /// Discovers local non-loopback IPv4 address on active LAN interfaces.
   /// Prioritizes Wi-Fi (wlan, ap, p2p) and Ethernet (eth), filtering out virtual/VPN/cellular.
   static Future<String?> getLocalIpAddress() async {
     if (customLocalIp != null) return customLocalIp;
+
     try {
       final interfaces = await NetworkInterface.list(
         includeLoopback: false,
         type: InternetAddressType.IPv4,
-      );
+      ).timeout(const Duration(seconds: 1), onTimeout: () => []);
 
       // Prioritize Wi-Fi and Ethernet
       interfaces.sort((a, b) {
@@ -84,6 +88,36 @@ class NetworkUtils {
       return false;
     } finally {
       client.close();
+    }
+  }
+
+  /// Pings an address using raw socket to check reachability.
+  static Future<bool> isHostReachable(String host, int port, {Duration timeout = const Duration(seconds: 2)}) async {
+    try {
+      final socket = await Socket.connect(host, port, timeout: timeout);
+      socket.destroy();
+      return true;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Checks if given IP string is a valid private IPv4 range.
+  static bool isPrivateIp(String ip) {
+    try {
+      final parts = ip.split('.').map(int.parse).toList();
+      if (parts.length != 4) return false;
+
+      // 10.0.0.0/8
+      if (parts[0] == 10) return true;
+      // 172.16.0.0/12
+      if (parts[0] == 172 && parts[1] >= 16 && parts[1] <= 31) return true;
+      // 192.168.0.0/16
+      if (parts[0] == 192 && parts[1] == 168) return true;
+
+      return false;
+    } catch (_) {
+      return false;
     }
   }
 }

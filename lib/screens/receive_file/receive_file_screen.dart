@@ -9,8 +9,8 @@ import '../../models/models.dart';
 import '../../network/http_client.dart';
 import '../../network/local_server.dart';
 import '../../network/websocket_service.dart';
-import '../../repositories/transfer_repository.dart';
-import '../../transfer/transfer_engine.dart';
+import '../../transfer/batch_transfer_coordinator.dart';
+import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
 
@@ -39,8 +39,16 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
     type: FileType.Other,
   );
   String _senderName = "Nearby Sender";
+  BatchManifest? _currentBatchManifest;
   Manifest? _currentManifest;
   DiscoveredRoom? _discoveredRoom;
+
+  String _formatBytes(int bytes) {
+    if (bytes < 1024) return '$bytes B';
+    if (bytes < 1024 * 1024) return '${(bytes / 1024).toStringAsFixed(1)} KB';
+    if (bytes < 1024 * 1024 * 1024) return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
 
   @override
   void initState() {
@@ -87,38 +95,31 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
       }
 
       final httpClient = P2PHttpClient();
-      ManifestFetchResult result;
+      BatchManifestFetchResult result;
       try {
-        result = await httpClient.downloadManifest(room.ip, room.port);
+        result = await httpClient.downloadBatchManifest(room.ip, room.port);
       } finally {
         httpClient.close();
       }
 
-      if (result is ManifestFetchSuccess) {
-        final manifest = result.manifest;
-        _currentManifest = manifest;
+      if (result is BatchManifestFetchSuccess) {
+        final batch = result.batchManifest;
+        _currentBatchManifest = batch;
+        _currentManifest = batch.manifests.isNotEmpty ? batch.manifests.first : null;
         _discoveredRoom = room;
 
-        final ext = manifest.fileName.contains('.')
-            ? manifest.fileName.split('.').last.toLowerCase()
+        final firstManifest = batch.manifests.isNotEmpty ? batch.manifests.first : null;
+        final ext = firstManifest != null && firstManifest.fileName.contains('.')
+            ? firstManifest.fileName.split('.').last.toLowerCase()
             : '';
-        String formattedSize;
-        final bytes = manifest.fileSize;
-        if (bytes < 1024) {
-          formattedSize = '$bytes B';
-        } else if (bytes < 1024 * 1024) {
-          formattedSize = '${(bytes / 1024).toStringAsFixed(1)} KB';
-        } else if (bytes < 1024 * 1024 * 1024) {
-          formattedSize = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-        } else {
-          formattedSize = '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-        }
 
         final fileInfo = FileInfo(
-          id: manifest.fileId,
-          name: manifest.fileName,
-          sizeBytes: manifest.fileSize,
-          formattedSize: formattedSize,
+          id: firstManifest?.fileId ?? 'batch',
+          name: batch.manifests.length > 1
+              ? '${batch.totalFiles} files (${_formatBytes(batch.totalBytes)})'
+              : (firstManifest?.fileName ?? 'File'),
+          sizeBytes: batch.totalBytes,
+          formattedSize: _formatBytes(batch.totalBytes),
           extension: ext,
           type: FileType.fromString(ext),
         );
@@ -132,7 +133,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
             _senderName = room.deviceName ?? 'Host (${room.ip})';
           });
         }
-      } else if (result is ManifestFetchError) {
+      } else if (result is BatchManifestFetchError) {
         if (mounted) {
           setState(() {
             _isConnecting = false;
@@ -168,45 +169,38 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
 
     try {
       final httpClient = P2PHttpClient();
-      ManifestFetchResult result;
+      BatchManifestFetchResult result;
       try {
-        result = await httpClient.downloadManifest(ip, port);
+        result = await httpClient.downloadBatchManifest(ip, port);
       } finally {
         httpClient.close();
       }
 
-      if (result is ManifestFetchSuccess) {
-        final manifest = result.manifest;
+      if (result is BatchManifestFetchSuccess) {
+        final batch = result.batchManifest;
+        final firstManifest = batch.manifests.isNotEmpty ? batch.manifests.first : null;
         final room = DiscoveredRoom(
-          roomId: manifest.fileId,
+          roomId: batch.batchId,
           ip: ip,
           port: port,
           pin: 'DIRECT',
           deviceName: 'Direct Host ($ip)',
         );
-        _currentManifest = manifest;
+        _currentBatchManifest = batch;
+        _currentManifest = firstManifest;
         _discoveredRoom = room;
 
-        final ext = manifest.fileName.contains('.')
-            ? manifest.fileName.split('.').last.toLowerCase()
+        final ext = firstManifest != null && firstManifest.fileName.contains('.')
+            ? firstManifest.fileName.split('.').last.toLowerCase()
             : '';
-        String formattedSize;
-        final bytes = manifest.fileSize;
-        if (bytes < 1024) {
-          formattedSize = '$bytes B';
-        } else if (bytes < 1024 * 1024) {
-          formattedSize = '${(bytes / 1024).toStringAsFixed(1)} KB';
-        } else if (bytes < 1024 * 1024 * 1024) {
-          formattedSize = '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-        } else {
-          formattedSize = '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-        }
 
         final fileInfo = FileInfo(
-          id: manifest.fileId,
-          name: manifest.fileName,
-          sizeBytes: manifest.fileSize,
-          formattedSize: formattedSize,
+          id: firstManifest?.fileId ?? 'batch',
+          name: batch.manifests.length > 1
+              ? '${batch.totalFiles} files (${_formatBytes(batch.totalBytes)})'
+              : (firstManifest?.fileName ?? 'File'),
+          sizeBytes: batch.totalBytes,
+          formattedSize: _formatBytes(batch.totalBytes),
           extension: ext,
           type: FileType.fromString(ext),
         );
@@ -220,7 +214,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
             _senderName = 'Direct Host ($ip)';
           });
         }
-      } else if (result is ManifestFetchError) {
+      } else if (result is BatchManifestFetchError) {
         if (mounted) {
           setState(() => _isConnecting = false);
           ScaffoldMessenger.of(context).showSnackBar(
@@ -594,10 +588,10 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                 ),
                 const SizedBox(height: AppSpacing.s20),
 
-                // Incoming File Details Card
+                // Incoming File(s) Details Card
                 Container(
                   width: double.infinity,
-                  padding: const EdgeInsets.all(AppSpacing.s24),
+                  padding: const EdgeInsets.all(AppSpacing.s20),
                   decoration: BoxDecoration(
                     color: AppColors.backgroundWhite,
                     borderRadius: AppShapes.cardBorderRadius,
@@ -606,24 +600,26 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                   child: Column(
                     children: [
                       Container(
-                        width: 72,
-                        height: 72,
+                        width: 60,
+                        height: 60,
                         decoration: BoxDecoration(
                           color: AppColors.lightGray,
-                          borderRadius: BorderRadius.circular(16.0),
+                          borderRadius: BorderRadius.circular(14.0),
                           border: Border.all(color: AppColors.borderGray),
                         ),
-                        child: const Icon(
-                          Icons.movie_outlined,
+                        child: Icon(
+                          _currentBatchManifest != null && _currentBatchManifest!.manifests.length > 1
+                              ? Icons.folder_copy_rounded
+                              : Icons.insert_drive_file_rounded,
                           color: AppColors.primaryBlack,
-                          size: 36,
+                          size: 30,
                         ),
                       ),
-                      const SizedBox(height: AppSpacing.s16),
+                      const SizedBox(height: AppSpacing.s12),
                       Text(
                         _incomingFile.name,
                         style: const TextStyle(
-                          fontSize: 18,
+                          fontSize: 17,
                           fontWeight: FontWeight.bold,
                           color: AppColors.primaryBlack,
                         ),
@@ -631,21 +627,59 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                       ),
                       const SizedBox(height: AppSpacing.s4),
                       Text(
-                        '${_incomingFile.formattedSize} • ${_incomingFile.extension.toUpperCase()}',
+                        _currentBatchManifest != null && _currentBatchManifest!.manifests.length > 1
+                            ? '${_currentBatchManifest!.totalFiles} files • ${_formatBytes(_currentBatchManifest!.totalBytes)}'
+                            : '${_incomingFile.formattedSize} • ${_incomingFile.extension.toUpperCase()}',
                         style: const TextStyle(
-                          fontSize: 14,
+                          fontSize: 13,
                           fontWeight: FontWeight.w500,
                           color: AppColors.mediumGray,
                         ),
                         textAlign: TextAlign.center,
                       ),
+                      if (_currentBatchManifest != null && _currentBatchManifest!.manifests.length > 1) ...[
+                        const SizedBox(height: 16),
+                        const Divider(height: 1, color: AppColors.borderGray),
+                        const SizedBox(height: 12),
+                        ConstrainedBox(
+                          constraints: const BoxConstraints(maxHeight: 200),
+                          child: ListView.builder(
+                            shrinkWrap: true,
+                            itemCount: _currentBatchManifest!.manifests.length,
+                            itemBuilder: (context, idx) {
+                              final m = _currentBatchManifest!.manifests[idx];
+                              return Padding(
+                                padding: const EdgeInsets.symmetric(vertical: 4),
+                                child: Row(
+                                  children: [
+                                    const Icon(Icons.insert_drive_file_outlined, size: 16, color: AppColors.darkGray),
+                                    const SizedBox(width: 8),
+                                    Expanded(
+                                      child: Text(
+                                        m.fileName,
+                                        style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w500),
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    const SizedBox(width: 8),
+                                    Text(
+                                      _formatBytes(m.fileSize),
+                                      style: const TextStyle(fontSize: 12, color: AppColors.mediumGray),
+                                    ),
+                                  ],
+                                ),
+                              );
+                            },
+                          ),
+                        ),
+                      ],
                     ],
                   ),
                 ),
                 const SizedBox(height: AppSpacing.s20),
 
                 // File Details
-                const SectionHeader(title: 'File Details'),
+                const SectionHeader(title: 'Transfer Details'),
                 Container(
                   decoration: BoxDecoration(
                     color: AppColors.backgroundWhite,
@@ -655,14 +689,14 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                   child: Column(
                     children: [
                       _buildMetadataRow(
-                        label: 'File type',
-                        value: '${_incomingFile.type.displayName} ${_incomingFile.extension.toUpperCase()}',
-                        icon: Icons.category_outlined,
+                        label: 'Total Files',
+                        value: '${_currentBatchManifest?.totalFiles ?? 1}',
+                        icon: Icons.numbers_rounded,
                       ),
                       const Divider(height: 1, color: AppColors.borderGray),
                       _buildMetadataRow(
-                        label: 'File size',
-                        value: _incomingFile.formattedSize,
+                        label: 'Total Size',
+                        value: _formatBytes(_currentBatchManifest?.totalBytes ?? _incomingFile.sizeBytes),
                         icon: Icons.data_usage_rounded,
                       ),
                       const Divider(height: 1, color: AppColors.borderGray),
@@ -680,22 +714,27 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                 Column(
                   children: [
                     PrimaryButton(
-                      text: 'ACCEPT',
+                      text: _currentBatchManifest != null && _currentBatchManifest!.manifests.length > 1
+                          ? 'ACCEPT BATCH (${_currentBatchManifest!.totalFiles} FILES)'
+                          : 'ACCEPT',
                       icon: Icons.check_circle_outline_rounded,
                       onPressed: () async {
-                        if (_currentManifest == null || _discoveredRoom == null) return;
+                        if (_discoveredRoom == null) return;
+                        final batch = _currentBatchManifest ??
+                            (_currentManifest != null
+                                ? BatchManifest.fromSingleManifest(_currentManifest!)
+                                : null);
+                        if (batch == null || batch.manifests.isEmpty) return;
 
                         try {
                           final docsDir = await getApplicationDocumentsDirectory();
                           final destDir = Directory('${docsDir.path}/FluxShare');
-                          final destFile = await FilenameSanitizer.resolveUniqueFile(
-                            destDir,
-                            _currentManifest!.fileName,
-                          );
+                          if (!await destDir.exists()) {
+                            await destDir.create(recursive: true);
+                          }
 
                           final localServer = LocalServer();
                           await localServer.start();
-                          localServer.setManifest(_currentManifest!, destFile);
 
                           final wsService = WebSocketService();
                           await wsService.connect(
@@ -712,14 +751,49 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                             httpPort: _discoveredRoom!.port,
                             webSocketPort: _discoveredRoom!.port,
                             availableChunks: Set.from(
-                              List.generate(_currentManifest!.chunkCount, (i) => i),
+                              List.generate(batch.manifests.first.chunkCount, (i) => i),
                             ),
                           );
 
+                          final List<BatchTransferItem> batchItems = [];
+                          final List<({Manifest manifest, File file})> serverBatch = [];
+
+                          for (final m in batch.manifests) {
+                            final destFile = await FilenameSanitizer.resolveUniqueFile(
+                              destDir,
+                              m.fileName,
+                            );
+                            serverBatch.add((manifest: m, file: destFile));
+
+                            final ext = m.fileName.contains('.')
+                                ? m.fileName.split('.').last.toLowerCase()
+                                : '';
+                            final info = FileInfo(
+                              id: m.fileId,
+                              name: m.fileName,
+                              sizeBytes: m.fileSize,
+                              formattedSize: _formatBytes(m.fileSize),
+                              extension: ext,
+                              type: FileType.fromString(ext),
+                            );
+
+                            batchItems.add(
+                              BatchTransferItem(
+                                fileId: m.fileId,
+                                fileInfo: info,
+                                manifest: m,
+                                destinationFile: destFile,
+                                totalBytes: m.fileSize,
+                              ),
+                            );
+                          }
+
+                          localServer.setBatchManifests(serverBatch);
+
                           final settings = AppSettings();
-                          final engine = TransferEngine(
-                            manifest: _currentManifest!,
-                            destinationFile: destFile,
+                          final coordinator = BatchTransferCoordinator(
+                            batchId: batch.batchId,
+                            items: batchItems,
                             swarmPeers: [hostPeer],
                             localServer: localServer,
                             webSocketService: wsService,
@@ -729,16 +803,22 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
                             scheduler: settings.createConfiguredScheduler(),
                           );
 
-                          TransferRepository().registerEngine(_currentManifest!.fileId, engine);
-                          engine.start();
+                          await TransferSessionManager.instance.startReceiverBatchSession(
+                            coordinator: coordinator,
+                            batchManifest: batch,
+                          );
+
+                          coordinator.start();
 
                           if (context.mounted) {
                             Navigator.of(context).pushReplacement(
                               MaterialPageRoute(
                                 builder: (context) => TransferProgressScreen(
-                                  fileInfo: _incomingFile,
-                                  engine: engine,
-                                  destinationFile: destFile,
+                                  batchCoordinator: coordinator,
+                                  batchManifest: batch,
+                                  fileInfo: batchItems.first.fileInfo,
+                                  destinationFile: batchItems.first.destinationFile,
+                                  manifest: batch.manifests.first,
                                   isHost: false,
                                 ),
                               ),

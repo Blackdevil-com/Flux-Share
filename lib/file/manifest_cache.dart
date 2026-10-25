@@ -134,54 +134,84 @@ class ManifestCache {
 
   /// Looks up a cached manifest for [file].
   /// Returns null if not cached, if modified, or if fingerprint validation fails.
-  Future<Manifest?> get(File file, {required int expectedChunkSize}) async {
+  Future<Manifest?> get(File file, {int? expectedChunkSize}) async {
     try {
       if (!await file.exists()) return null;
 
       final length = await file.length();
       final lastModified = (await file.lastModified()).millisecondsSinceEpoch;
-      final key = _generateKey(file.path, length, lastModified, expectedChunkSize);
 
-      // 1. Check in-memory cache
-      if (_memoryCache.containsKey(key)) {
-        final entry = _memoryCache[key]!;
-        // Verify fingerprint
-        final currentFingerprint = await computeHeadTailFingerprint(file, length);
-        if (currentFingerprint != null && currentFingerprint == entry.fingerprint) {
-          return entry.manifest;
+      final List<int> chunkSizes;
+      if (expectedChunkSize != null) {
+        chunkSizes = [expectedChunkSize];
+      } else {
+        int defaultCs;
+        if (length <= 10 * 1024 * 1024) {
+          defaultCs = 512 * 1024;
+        } else if (length <= 100 * 1024 * 1024) {
+          defaultCs = 1024 * 1024;
+        } else if (length <= 500 * 1024 * 1024) {
+          defaultCs = 2 * 1024 * 1024;
+        } else if (length <= 1024 * 1024 * 1024) {
+          defaultCs = 4 * 1024 * 1024;
         } else {
-          // File content changed despite same size/timestamp -> invalidate
-          _memoryCache.remove(key);
+          defaultCs = 8 * 1024 * 1024;
         }
+        chunkSizes = [
+          defaultCs,
+          512 * 1024,
+          1024 * 1024,
+          2 * 1024 * 1024,
+          4 * 1024 * 1024,
+          8 * 1024 * 1024,
+        ];
       }
 
-      // 2. Check per-entry disk file
-      final cacheDir = await _getCacheDirectory();
-      if (cacheDir != null) {
-        final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
-        if (await cacheFile.exists()) {
-          final raw = await cacheFile.readAsString();
-          final Map<String, dynamic> json = jsonDecode(raw) as Map<String, dynamic>;
+      String? currentFingerprint;
 
-          final cachedFingerprint = json['fingerprint'] as String?;
-          final manifestJson = json['manifest'] as Map<String, dynamic>;
-          final manifest = Manifest.fromJson(manifestJson);
+      for (final cs in chunkSizes) {
+        final key = _generateKey(file.path, length, lastModified, cs);
 
-          // Verify head/tail fingerprint
-          final currentFingerprint = await computeHeadTailFingerprint(file, length);
-          if (currentFingerprint != null && currentFingerprint == cachedFingerprint) {
-            // Populate in-memory LRU cache
-            _addToMemoryCache(key, _CachedManifestEntry(
-              manifest: manifest,
-              fingerprint: currentFingerprint,
-              cachedAt: DateTime.now(),
-            ));
-            return manifest;
+        // 1. Check in-memory cache
+        if (_memoryCache.containsKey(key)) {
+          final entry = _memoryCache[key]!;
+          currentFingerprint ??= await computeHeadTailFingerprint(file, length);
+          if (currentFingerprint != null && currentFingerprint == entry.fingerprint) {
+            return entry.manifest;
           } else {
-            // Stale entry, delete disk file
-            try {
-              await cacheFile.delete();
-            } catch (_) {}
+            // File content changed despite same size/timestamp -> invalidate
+            _memoryCache.remove(key);
+          }
+        }
+
+        // 2. Check per-entry disk file
+        final cacheDir = await _getCacheDirectory();
+        if (cacheDir != null) {
+          final cacheFile = File('${cacheDir.path}${Platform.pathSeparator}${_keyToFileName(key)}.json');
+          if (await cacheFile.exists()) {
+            final raw = await cacheFile.readAsString();
+            final Map<String, dynamic> json = jsonDecode(raw) as Map<String, dynamic>;
+
+            final cachedFingerprint = json['fingerprint'] as String?;
+            final manifestJson = json['manifest'] as Map<String, dynamic>;
+            final manifest = Manifest.fromJson(manifestJson);
+
+            // Verify head/tail fingerprint
+            currentFingerprint ??= await computeHeadTailFingerprint(file, length);
+            if (currentFingerprint != null && currentFingerprint == cachedFingerprint) {
+              // Populate in-memory LRU cache
+              _addToMemoryCache(key, _CachedManifestEntry(
+                manifest: manifest,
+                fingerprint: currentFingerprint,
+                cachedAt: DateTime.now(),
+              ));
+              return manifest;
+            } else {
+              // Stale entry, delete disk file
+              try {
+                await cacheFile.delete();
+              } catch (_) {}
+            }
           }
         }
       }

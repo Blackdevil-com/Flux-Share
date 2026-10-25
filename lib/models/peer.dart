@@ -7,6 +7,7 @@ class PeerInfo {
   final int httpPort;
   final int webSocketPort;
   Set<int> availableChunks; // VERIFIED chunks only
+  Map<String, Set<int>> availableChunksByFile;
   double emaThroughput;
   double successRate;
   int activeRequests;
@@ -21,12 +22,27 @@ class PeerInfo {
     required this.httpPort,
     required this.webSocketPort,
     Set<int>? availableChunks,
+    Map<String, Set<int>>? availableChunksByFile,
     this.emaThroughput = 0.0,
     this.successRate = 1.0,
     this.activeRequests = 0,
     this.lastSeenMillis = 0,
     this.connectionStatus = 'available',
-  }) : availableChunks = availableChunks ?? <int>{};
+  })  : availableChunks = availableChunks ?? <int>{},
+        availableChunksByFile = availableChunksByFile ?? <String, Set<int>>{};
+
+  Set<int> getAvailableChunksForFile(String fileId) {
+    final fileChunks = availableChunksByFile[fileId];
+    if (fileChunks != null && fileChunks.isNotEmpty) {
+      return fileChunks;
+    }
+    return availableChunks;
+  }
+
+  void markChunkAvailableForFile(String fileId, int chunkId) {
+    availableChunksByFile.putIfAbsent(fileId, () => <int>{}).add(chunkId);
+    availableChunks.add(chunkId);
+  }
 
   void touch() {
     lastSeenMillis = DateTime.now().millisecondsSinceEpoch;
@@ -62,6 +78,7 @@ class PeerInfo {
         'httpPort': httpPort,
         'webSocketPort': webSocketPort,
         'availableChunks': availableChunks.toList(),
+        'availableChunksByFile': availableChunksByFile.map((k, v) => MapEntry(k, v.toList())),
         'emaThroughput': emaThroughput,
         'successRate': successRate,
         'activeRequests': activeRequests,
@@ -69,7 +86,18 @@ class PeerInfo {
         'connectionStatus': connectionStatus,
       };
 
-  factory PeerInfo.fromJson(Map<String, dynamic> json) => PeerInfo(
+  factory PeerInfo.fromJson(Map<String, dynamic> json) {
+    final rawByFile = json['availableChunksByFile'] as Map<String, dynamic>?;
+    final chunksByFile = <String, Set<int>>{};
+    if (rawByFile != null) {
+      rawByFile.forEach((k, v) {
+        if (v is List) {
+          chunksByFile[k] = v.map((e) => (e as num).toInt()).toSet();
+        }
+      });
+    }
+
+    return PeerInfo(
         peerId: json['peerId'] as String,
         deviceName: json['deviceName'] as String,
         platform: (json['platform'] as String?) ?? 'android',
@@ -80,12 +108,14 @@ class PeerInfo {
                 ?.map((e) => (e as num).toInt())
                 .toSet() ??
             <int>{},
+        availableChunksByFile: chunksByFile,
         emaThroughput: (json['emaThroughput'] as num?)?.toDouble() ?? 0.0,
         successRate: (json['successRate'] as num?)?.toDouble() ?? 1.0,
         activeRequests: (json['activeRequests'] as num?)?.toInt() ?? 0,
         lastSeenMillis: (json['lastSeenMillis'] as num?)?.toInt() ?? 0,
         connectionStatus: (json['connectionStatus'] as String?) ?? 'available',
       );
+  }
 
   PeerInfo copyWith({
     String? peerId,
@@ -95,6 +125,7 @@ class PeerInfo {
     int? httpPort,
     int? webSocketPort,
     Set<int>? availableChunks,
+    Map<String, Set<int>>? availableChunksByFile,
     double? emaThroughput,
     double? successRate,
     int? activeRequests,
@@ -108,7 +139,11 @@ class PeerInfo {
       ip: ip ?? this.ip,
       httpPort: httpPort ?? this.httpPort,
       webSocketPort: webSocketPort ?? this.webSocketPort,
-      availableChunks: availableChunks ?? Set.from(this.availableChunks),
+      availableChunks: availableChunks ?? Set<int>.from(this.availableChunks),
+      availableChunksByFile: availableChunksByFile ??
+          Map<String, Set<int>>.from(
+            this.availableChunksByFile.map((k, v) => MapEntry(k, Set<int>.from(v))),
+          ),
       emaThroughput: emaThroughput ?? this.emaThroughput,
       successRate: successRate ?? this.successRate,
       activeRequests: activeRequests ?? this.activeRequests,

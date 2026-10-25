@@ -51,15 +51,18 @@ class ChunkDownloader {
               ..maxConnectionsPerHost = 10);
 
   /// Downloads a chunk streaming bytes directly to disk and hashing in-flight.
-  /// Never buffers the entire chunk in RAM.
+  /// Never buffers the entire chunk in RAM. Supports multi-file endpoint with legacy fallback.
   Future<ChunkDownloadResult> downloadChunk({
     required PeerInfo peer,
     required ChunkMeta chunkMeta,
     required ChunkWriterSession writerSession,
+    String? fileId,
     Duration requestTimeout = const Duration(seconds: 6),
   }) async {
     final stopwatch = Stopwatch()..start();
-    final url = 'http://${peer.ip}:${peer.httpPort}/chunk/${chunkMeta.chunkId}';
+    final primaryUrl = fileId != null
+        ? 'http://${peer.ip}:${peer.httpPort}/file/$fileId/chunk/${chunkMeta.chunkId}'
+        : 'http://${peer.ip}:${peer.httpPort}/chunk/${chunkMeta.chunkId}';
 
     Duration? timeToFirstByte;
     int bytesReceived = 0;
@@ -70,17 +73,31 @@ class ChunkDownloader {
     final inFlightHasher = sha256.startChunkedConversion(digestSink);
 
     try {
-      final requestFuture = _httpClient.getUrl(Uri.parse(url));
+      HttpClientResponse response;
+      final requestFuture = _httpClient.getUrl(Uri.parse(primaryUrl));
       final request = await requestFuture.timeout(
         const Duration(seconds: 3),
         onTimeout: () => throw TimeoutException('Connection timed out connecting to ${peer.ip}'),
       );
 
       final responseFuture = request.close();
-      final response = await responseFuture.timeout(
+      response = await responseFuture.timeout(
         const Duration(seconds: 4),
         onTimeout: () => throw TimeoutException('Peer ${peer.ip} failed to send response headers'),
       );
+
+      // If multi-file endpoint returned 404, fallback to legacy /chunk/<id>
+      if (response.statusCode == HttpStatus.notFound && fileId != null) {
+        final fallbackUrl = 'http://${peer.ip}:${peer.httpPort}/chunk/${chunkMeta.chunkId}';
+        final fallbackReq = await _httpClient.getUrl(Uri.parse(fallbackUrl)).timeout(
+          const Duration(seconds: 3),
+          onTimeout: () => throw TimeoutException('Fallback connection timed out to ${peer.ip}'),
+        );
+        response = await fallbackReq.close().timeout(
+          const Duration(seconds: 4),
+          onTimeout: () => throw TimeoutException('Peer ${peer.ip} failed on fallback headers'),
+        );
+      }
 
       if (response.statusCode != HttpStatus.ok) {
         stopwatch.stop();
@@ -96,9 +113,7 @@ class ChunkDownloader {
 
       // Stream incoming bytes directly to disk and in-flight hasher
       await for (final buffer in response.timeout(requestTimeout)) {
-        if (timeToFirstByte == null) {
-          timeToFirstByte = stopwatch.elapsed;
-        }
+        timeToFirstByte ??= stopwatch.elapsed;
 
         inFlightHasher.add(buffer);
         bytesReceived += buffer.length;

@@ -73,18 +73,20 @@ class WebSocketService {
   }
 
   /// Broadcasts that a chunk has been downloaded and verified on disk.
-  void notifyChunkAvailable(int chunkId) {
+  void notifyChunkAvailable(int chunkId, {String? fileId}) {
     send({
       'type': 'CHUNK_AVAILABLE',
       'chunkId': chunkId,
+      if (fileId != null) 'fileId': fileId,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
     });
   }
 
   /// Broadcasts that transfer finished and all chunks passed Tier 1-3 integrity.
-  void notifyTransferCompleted() {
+  void notifyTransferCompleted({String? fileId}) {
     send({
       'type': 'TRANSFER_COMPLETED',
+      if (fileId != null) 'fileId': fileId,
       'timestamp': DateTime.now().millisecondsSinceEpoch,
     });
   }
