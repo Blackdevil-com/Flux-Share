@@ -10,6 +10,7 @@ class WebSocketService {
       StreamController<Map<String, dynamic>>.broadcast();
 
   Stream<Map<String, dynamic>> get messages => _messageController.stream;
+  Stream<Map<String, dynamic>> get messageStream => _messageController.stream;
   bool get isConnected => _channel != null;
 
   /// Connects to host's /ws endpoint supporting both named and positional parameters.
@@ -70,6 +71,68 @@ class WebSocketService {
         _channel!.sink.add(jsonEncode(message));
       } catch (_) {}
     }
+  }
+
+  void dispose() {
+    disconnect();
+  }
+
+  /// Announces receiver has joined the room with metadata
+  void sendReceiverJoined({
+    String sessionId = '',
+    required String peerId,
+    required String deviceName,
+    String platform = 'Android',
+    String? ip,
+  }) {
+    send({
+      'type': 'RECEIVER_JOINED',
+      'sessionId': sessionId,
+      'peerId': peerId,
+      'deviceName': deviceName,
+      'platform': platform,
+      if (ip != null) 'ip': ip,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  /// Announces receiver has verified manifest and destination space, ready to receive
+  void sendReceiverReady({
+    String sessionId = '',
+    required String peerId,
+    String deviceName = 'Receiver',
+    int? availableStorageBytes,
+  }) {
+    send({
+      'type': 'RECEIVER_READY',
+      'sessionId': sessionId,
+      'peerId': peerId,
+      'deviceName': deviceName,
+      if (availableStorageBytes != null) 'availableStorageBytes': availableStorageBytes,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    });
+  }
+
+  /// Announces receiver encountered an error during join or preparation
+  void sendReceiverFailed({
+    String sessionId = '',
+    required String peerId,
+    String errorMessage = '',
+    String? error,
+    int? availableBytes,
+    int? requiredBytes,
+  }) {
+    final msg = error ?? errorMessage;
+    send({
+      'type': 'RECEIVER_FAILED',
+      'sessionId': sessionId,
+      'peerId': peerId,
+      'errorMessage': msg,
+      'error': msg,
+      if (availableBytes != null) 'available': availableBytes,
+      if (requiredBytes != null) 'required': requiredBytes,
+      'timestamp': DateTime.now().millisecondsSinceEpoch,
+    });
   }
 
   /// Broadcasts that a chunk has been downloaded and verified on disk.
@@ -158,12 +221,9 @@ class WebSocketService {
   void disconnect() {
     _heartbeatTimer?.cancel();
     _heartbeatTimer = null;
-    _channel?.sink.close();
+    try {
+      _channel?.sink.close();
+    } catch (_) {}
     _channel = null;
-  }
-
-  void dispose() {
-    disconnect();
-    _messageController.close();
   }
 }

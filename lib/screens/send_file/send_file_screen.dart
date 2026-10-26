@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:uuid/uuid.dart';
 import '../../app/theme.dart';
 import '../../discovery/discovery_service.dart';
 import '../../file/file_picker_service.dart';
@@ -10,6 +12,7 @@ import '../../file/session_manifest_cache.dart';
 import '../../models/batch_manifest.dart';
 import '../../models/device.dart';
 import '../../models/file_info.dart';
+import '../../models/connected_receiver.dart';
 import '../../models/manifest.dart';
 import '../../network/local_server.dart';
 import '../../network/network_utils.dart';
@@ -18,6 +21,7 @@ import '../../room/room_manager.dart';
 import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
+import '../../services/managed_temporary_file_service.dart';
 
 enum FilePreparationStatus {
   selected,
@@ -47,6 +51,8 @@ class PickedFileItem {
   String? errorMessage;
   bool isCancelled;
   final String? identifier;
+  final bool isManaged;
+  final String? sessionId;
   final ValueNotifier<ManifestProgress?> progressNotifier;
 
   PickedFileItem({
@@ -60,6 +66,8 @@ class PickedFileItem {
     this.errorMessage,
     this.isCancelled = false,
     this.identifier,
+    this.isManaged = false,
+    this.sessionId,
   }) : progressNotifier = ValueNotifier<ManifestProgress?>(progress);
 
   bool get isReady => status.isManifestReady && manifest != null;
@@ -72,6 +80,8 @@ class PickedFileItem {
       extension: info.extension,
       type: info.type,
       identifier: identifier,
+      isManaged: isManaged,
+      sessionId: sessionId,
     );
   }
 }
@@ -109,6 +119,7 @@ class SendFileScreen extends StatefulWidget {
 }
 
 class _SendFileScreenState extends State<SendFileScreen> {
+  late final String _sessionId;
   final DeviceRepository _deviceRepository = DeviceRepository();
   final DiscoveryService _discoveryService = DiscoveryService();
   final List<PickedFileItem> _selectedFiles = [];
@@ -121,19 +132,26 @@ class _SendFileScreenState extends State<SendFileScreen> {
   bool _isLoadingDevices = true;
   late String _roomPin;
   String _hostAddress = '';
+  bool _isHostingStarted = false;
+  BatchManifest? _hostedBatchManifest;
+  bool _navigatedToTransfer = false;
+  List<ConnectedReceiver> _connectedReceivers = [];
+  StreamSubscription<List<ConnectedReceiver>>? _receiversSub;
 
   @override
   void initState() {
     super.initState();
+    _sessionId = 'send_session_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(9999)}';
     _generateRoomPin();
     if (widget.initialPickedItems != null && widget.initialPickedItems!.isNotEmpty) {
       _selectedFiles.addAll(widget.initialPickedItems!);
       _startPreparationQueue();
     } else if (widget.initialFile != null) {
       final file = File(widget.initialFile!.id);
+      final id = widget.initialManifest?.fileId ?? const Uuid().v4();
       _selectedFiles.add(
         PickedFileItem(
-          id: widget.initialFile!.id,
+          id: id,
           jobId: 1,
           file: file,
           info: widget.initialFile!,
@@ -159,9 +177,28 @@ class _SendFileScreenState extends State<SendFileScreen> {
       item.isCancelled = true;
       item.jobId++;
       item.progressNotifier.dispose();
+      if (item.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+          item.sessionId ?? _sessionId,
+          item.file.path,
+          reason: 'user_cleared_all_files',
+        ));
+      }
     }
     _sessionCache.clear();
     _manifestUpdateNotifier.dispose();
+    _receiversSub?.cancel();
+    if (!_navigatedToTransfer) {
+      if (_isHostingStarted) {
+        _discoveryService.stopRoomHost();
+        RoomManager().expireRoom();
+        LocalServer().clearBatch();
+      }
+      unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+        _sessionId,
+        reason: 'send_file_screen_disposed_before_transfer',
+      ));
+    }
     super.dispose();
   }
 
@@ -238,7 +275,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   /// Opens the native multi-file picker to add more files to the selection.
   Future<void> _openFileBrowser() async {
     try {
-      final payloads = await FilePickerService.pickMultipleFilePayloads();
+      final payloads = await FilePickerService.pickMultipleFilePayloads(sessionId: _sessionId);
       if (payloads.isEmpty) {
         debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
         return;
@@ -267,14 +304,17 @@ class _SendFileScreenState extends State<SendFileScreen> {
         }
 
         final item = PickedFileItem(
-          id: '${payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+          id: const Uuid().v4(),
           jobId: 1,
           file: payload.file,
           info: payload.toFileInfo(),
           status: FilePreparationStatus.selected,
           identifier: payload.identifier,
+          isManaged: payload.isManaged,
+          sessionId: payload.sessionId ?? _sessionId,
         );
         _selectedFiles.add(item);
+        _hostedBatchManifest = null;
         addedCount++;
         debugPrint('[FluxShare-Diag] [B1:Select] jobId=${item.jobId}, file=${item.info.name}, size=${item.info.sizeBytes}');
       }
@@ -314,7 +354,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   /// preserves valid manifests for unchanged files, and applies confirmed changes.
   Future<void> _openChangeFlow() async {
     try {
-      final newPayloads = await FilePickerService.pickMultipleFilePayloads();
+      final newPayloads = await FilePickerService.pickMultipleFilePayloads(sessionId: _sessionId);
       if (newPayloads.isEmpty) {
         debugPrint('[FluxShare] Change flow cancelled by user; retaining existing selection.');
         return;
@@ -593,6 +633,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
         item.isCancelled = true;
         item.jobId++;
         item.progressNotifier.dispose();
+        if (item.isManaged) {
+          unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+            item.sessionId ?? _sessionId,
+            item.file.path,
+            reason: 'removed_in_change_review',
+          ));
+        }
         _selectedFiles.remove(item);
       }
     }
@@ -621,14 +668,17 @@ class _SendFileScreenState extends State<SendFileScreen> {
       }
 
       final newItem = PickedFileItem(
-        id: '${item.payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+        id: const Uuid().v4(),
         jobId: 1,
         file: item.payload.file,
         info: item.payload.toFileInfo(),
         status: FilePreparationStatus.selected,
         identifier: item.payload.identifier,
+        isManaged: item.payload.isManaged,
+        sessionId: item.payload.sessionId ?? _sessionId,
       );
       _selectedFiles.add(newItem);
+      _hostedBatchManifest = null;
       newlyAddedCount++;
       debugPrint('[FluxShare-Diag] [B1:Select] jobId=${newItem.jobId}, file=${newItem.info.name}, size=${newItem.info.sizeBytes}');
     }
@@ -700,8 +750,16 @@ class _SendFileScreenState extends State<SendFileScreen> {
       removed.isCancelled = true;
       removed.jobId++;
       removed.progressNotifier.dispose();
+      if (removed.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+          removed.sessionId ?? _sessionId,
+          removed.file.path,
+          reason: 'user_removed_file',
+        ));
+      }
       setState(() {
         _selectedFiles.removeAt(index);
+        _hostedBatchManifest = null;
       });
       _manifestUpdateNotifier.value++;
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
@@ -796,6 +854,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
         _manifestUpdateNotifier.value++;
       }
 
+      if (targetItem.isManaged) {
+        ManagedTemporaryFileService.instance.registerActiveUse(
+          targetItem.sessionId ?? _sessionId,
+          targetItem.file.path,
+        );
+      }
+
       if (targetItem.isCancelled || targetItem.jobId != activeJobId) {
         outcome = 'cancelled_before_start';
         return;
@@ -845,6 +910,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
           targetItem.errorMessage = null;
         });
         _manifestUpdateNotifier.value++;
+        if (_selectedFiles.every((i) => i.isReady)) {
+          _startHostingRoom();
+        }
         debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, to=manifestReady');
       } else {
         outcome = 'cancelled_on_completion';
@@ -873,6 +941,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
         }
       }
     } finally {
+      if (targetItem.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+          targetItem.sessionId ?? _sessionId,
+          targetItem.file.path,
+        ));
+      }
       // CRITICAL: Always release worker slot regardless of how _processItem exits
       _activeWorkerJobIds.remove(activeJobId);
       debugPrint('[FluxShare-Diag] [B9:StateTransition] workerSlotReleased: jobId=$activeJobId, file=${targetItem.info.name}, remainingWorkers=${_activeWorkerJobIds.length}');
@@ -938,6 +1012,56 @@ class _SendFileScreenState extends State<SendFileScreen> {
     }
   }
 
+  Future<void> _startHostingRoom() async {
+    if (_isHostingStarted || !_canStartTransfer) return;
+    try {
+      final List<Manifest> manifests = _selectedFiles.map((i) => i.manifest!).toList();
+      final List<({Manifest manifest, File file})> batchItems =
+          _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
+
+      final batchManifest = _hostedBatchManifest ?? BatchManifest(
+        batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
+        manifests: manifests,
+      );
+      _hostedBatchManifest = batchManifest;
+
+      final server = LocalServer();
+      final port = await server.start();
+      server.replaceBatchManifests(batchManifest.batchId, batchItems);
+
+      final hostResult = await _discoveryService.startRoomHost(
+        pin: _roomPin,
+        roomId: batchManifest.batchId,
+        serverPort: port,
+        deviceName: server.localDeviceName,
+      );
+      if (hostResult is RoomHostStartFailure) {
+        debugPrint('[FluxShare] Early host discovery start notice: ${hostResult.reason}');
+      }
+
+      RoomManager().createRoom(
+        hostPeerId: server.localPeerId,
+        hostDeviceName: server.localDeviceName,
+        customPin: _roomPin,
+        manifest: manifests.first,
+        batchManifest: batchManifest,
+      );
+
+      _receiversSub?.cancel();
+      _receiversSub = server.connectedReceiversStream.listen((list) {
+        if (!mounted) return;
+        setState(() {
+          _connectedReceivers = list;
+        });
+      });
+
+      _isHostingStarted = true;
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('[FluxShare] Error starting room host early: $e');
+    }
+  }
+
   Future<void> _startTransfer() async {
     debugPrint('[FluxShare] Start Transfer received: ${_selectedFiles.length} files');
     if (!_canStartTransfer) {
@@ -957,21 +1081,36 @@ class _SendFileScreenState extends State<SendFileScreen> {
       final List<({Manifest manifest, File file})> batchItems =
           _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
 
-      final batchManifest = BatchManifest(
+      final batchManifest = _hostedBatchManifest ?? BatchManifest(
         batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
         manifests: manifests,
       );
+      _hostedBatchManifest = batchManifest;
 
       final server = LocalServer();
       final port = await server.start();
-      server.setBatchManifests(batchItems);
+      server.replaceBatchManifests(batchManifest.batchId, batchItems);
 
-      await _discoveryService.startRoomHost(
+      final hostResult = await _discoveryService.startRoomHost(
         pin: _roomPin,
         roomId: batchManifest.batchId,
         serverPort: port,
         deviceName: server.localDeviceName,
       );
+
+      if (hostResult is RoomHostStartFailure) {
+        debugPrint('[FluxShare-Network] [Host] Discovery listener failed: ${hostResult.reason}');
+        final localIp = await NetworkUtils.getLocalIpAddress() ?? '0.0.0.0';
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Room created, but UDP discovery listener failed to bind. Receivers can join using Direct IP: $localIp:$port'),
+              backgroundColor: AppColors.primaryBlack,
+              duration: const Duration(seconds: 6),
+            ),
+          );
+        }
+      }
 
       RoomManager().createRoom(
         hostPeerId: server.localPeerId,
@@ -985,12 +1124,24 @@ class _SendFileScreenState extends State<SendFileScreen> {
           .where((d) => _selectedDeviceIds.contains(d.id))
           .toList();
 
+      server.broadcastTransferStart(
+        sessionId: batchManifest.batchId,
+      );
+
+      ManagedTemporaryFileService.instance.aliasSession(
+        sourceSessionId: _sessionId,
+        targetSessionId: batchManifest.batchId,
+      );
+
       await TransferSessionManager.instance.startHostSession(
         server: server,
         batchManifest: batchManifest,
         receivers: selectedDevices,
         roomPin: _roomPin,
+        sessionId: _sessionId,
       );
+
+      _navigatedToTransfer = true;
 
       if (mounted) {
         await Navigator.of(context).pushReplacement(
@@ -1009,6 +1160,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
         );
       }
     } catch (e) {
+      _discoveryService.stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error preparing transfer: $e')),
@@ -1313,6 +1467,137 @@ class _SendFileScreenState extends State<SendFileScreen> {
               fontSize: 12,
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectedReceiversSection() {
+    if (!_isHostingStarted) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(AppSpacing.s16),
+      decoration: BoxDecoration(
+        color: AppColors.lightGray,
+        borderRadius: AppShapes.cardBorderRadius,
+        border: Border.all(color: AppColors.borderGray),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.devices_rounded, size: 18, color: AppColors.primaryBlack),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Connected Receivers (${_connectedReceivers.length})',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.primaryBlack,
+                    ),
+                  ),
+                ],
+              ),
+              if (_connectedReceivers.any((r) => r.status == ReceiverStatus.ready))
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade100,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    '${_connectedReceivers.where((r) => r.status == ReceiverStatus.ready).length} Ready',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.green.shade900,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (_connectedReceivers.isEmpty) ...[
+            Row(
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.mediumGray),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Waiting for receivers to enter PIN $_roomPin...',
+                    style: const TextStyle(fontSize: 12, color: AppColors.mediumGray),
+                  ),
+                ),
+              ],
+            ),
+          ] else ...[
+            Column(
+              children: _connectedReceivers.map((r) {
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppColors.backgroundWhite,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.borderGray),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        r.platform == DevicePlatform.iPhone
+                            ? Icons.phone_iphone_rounded
+                            : Icons.phone_android_rounded,
+                        size: 16,
+                        color: AppColors.primaryBlack,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          r.deviceName,
+                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: r.status == ReceiverStatus.ready
+                              ? Colors.green.shade100
+                              : (r.status == ReceiverStatus.failed
+                                  ? Colors.red.shade100
+                                  : Colors.blue.shade100),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          r.status.displayName,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: r.status == ReceiverStatus.ready
+                                ? Colors.green.shade900
+                                : (r.status == ReceiverStatus.failed
+                                    ? Colors.red.shade900
+                                    : Colors.blue.shade900),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
         ],
       ),
     );
@@ -1706,6 +1991,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
                       // 2. Room PIN Display Card
                       _buildRoomPinCard(),
+                      _buildConnectedReceiversSection(),
                       const SizedBox(height: AppSpacing.s20),
 
                       // 3. Selected Files Section (Cards below Room PIN)

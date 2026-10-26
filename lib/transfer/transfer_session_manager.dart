@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import '../models/connected_receiver.dart';
 import '../models/batch_manifest.dart';
 import '../models/device.dart';
 import '../models/file_info.dart';
@@ -7,8 +8,11 @@ import '../models/manifest.dart';
 import '../models/transfer.dart';
 import '../network/local_server.dart';
 import '../services/background_transfer_service.dart';
+import '../services/managed_temporary_file_service.dart';
 import 'batch_transfer_coordinator.dart';
 import 'transfer_engine.dart';
+import '../discovery/discovery_service.dart';
+import '../room/room_manager.dart';
 
 /// Represents an authoritative point-in-time snapshot of the active transfer session.
 class TransferProgressSnapshot {
@@ -26,6 +30,7 @@ class TransferProgressSnapshot {
   final List<BatchTransferItem> items;
   final Map<String, double> receiverProgressMap;
   final Map<String, int> peerChunkContributions;
+  final List<ConnectedReceiver> connectedReceivers;
   final String? errorMessage;
   final bool isPreviewReady;
 
@@ -44,6 +49,7 @@ class TransferProgressSnapshot {
     this.items = const [],
     this.receiverProgressMap = const {},
     this.peerChunkContributions = const {},
+    this.connectedReceivers = const [],
     this.errorMessage,
     this.isPreviewReady = false,
   });
@@ -53,6 +59,7 @@ class TransferProgressSnapshot {
   bool get isCancelled => status == TransferStatus.cancelled;
   bool get isFailed => status == TransferStatus.failed;
   bool get isTransferring => status == TransferStatus.transferring;
+  int get activeReceiverCount => connectedReceivers.where((r) => r.status != ReceiverStatus.disconnected && r.status != ReceiverStatus.failed).length;
 
   String get formattedRemainingTime {
     if (isPaused) return 'Paused';
@@ -84,12 +91,19 @@ class TransferSessionManager {
   StreamSubscription? _activeSub;
 
   final Map<String, double> _hostReceiverProgress = {};
+  final Map<String, int> _hostReceiverBytes = {};
+  final Map<String, double> _hostReceiverSpeed = {};
+  StreamSubscription? _serverReceiversSub;
   List<Device> _activeReceivers = [];
   FileInfo? _activeFileInfo;
   BatchManifest? _activeBatchManifest;
   Manifest? _activeManifest;
   String? _roomPin;
+  String? _activeSessionId;
   bool _isHost = false;
+  bool _hostCompletedEmitted = false;
+  DateTime? _lastHostSnapshotTime;
+  int _lastHostBytesTransferred = 0;
 
   TransferSessionManager._internal() {
     BackgroundTransferService.instance.addCancelListener(() {
@@ -122,10 +136,13 @@ class TransferSessionManager {
     required BatchManifest batchManifest,
     required List<Device> receivers,
     required String? roomPin,
+    String? sessionId,
   }) async {
     _cleanExistingSession();
 
     _isHost = true;
+    _hostCompletedEmitted = false;
+    _activeSessionId = sessionId ?? batchManifest.batchId;
     _activeServer = server;
     _activeBatchManifest = batchManifest;
     _activeReceivers = receivers;
@@ -142,11 +159,26 @@ class TransferSessionManager {
         : null;
 
     _hostReceiverProgress.clear();
+    _hostReceiverBytes.clear();
+    _hostReceiverSpeed.clear();
+    _lastHostSnapshotTime = null;
+    _lastHostBytesTransferred = 0;
     for (final r in receivers) {
       _hostReceiverProgress[r.id] = 0.0;
     }
+    for (final cr in server.connectedReceivers) {
+      _hostReceiverProgress[cr.peerId] = cr.progressPercent;
+      _hostReceiverBytes[cr.peerId] = cr.bytesReceived;
+    }
 
     _activeServer!.addControlListener(_handleHostControlMessage);
+    _serverReceiversSub = _activeServer!.connectedReceiversStream.listen((list) {
+      for (final cr in list) {
+        _hostReceiverProgress[cr.peerId] = cr.progressPercent;
+        _hostReceiverBytes[cr.peerId] = cr.bytesReceived;
+      }
+      _updateHostSnapshot();
+    });
 
     final totalFiles = batchManifest.totalFiles;
     final totalBytes = batchManifest.totalBytes;
@@ -164,6 +196,7 @@ class TransferSessionManager {
       totalFiles: totalFiles,
       currentFileName: batchManifest.manifests.first.fileName,
       receiverProgressMap: Map.from(_hostReceiverProgress),
+      connectedReceivers: server.connectedReceivers,
     );
     _emitSnapshot();
 
@@ -369,53 +402,124 @@ class TransferSessionManager {
 
     if (type == 'TRANSFER_PROGRESS') {
       final percent = (msg['percent'] as num?)?.toDouble() ?? 0.0;
+      final bytes = (msg['bytesTransferred'] as num?)?.toInt() ?? 0;
+      final speed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
+          (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
+
       _hostReceiverProgress[peerId] = percent;
+      _hostReceiverBytes[peerId] = bytes;
+      _hostReceiverSpeed[peerId] = speed;
 
-      final avg = _hostReceiverProgress.isNotEmpty
-          ? _hostReceiverProgress.values.reduce((a, b) => a + b) /
-              _hostReceiverProgress.length
-          : 0.0;
-
-      _currentSnapshot = TransferProgressSnapshot(
-        sessionId: _activeBatchManifest?.batchId ?? 'host_transfer',
-        isHost: true,
-        status: TransferStatus.transferring,
-        progressPercent: avg,
-        speedMbPerSec: 0.0,
-        bytesTransferred: 0,
-        totalBytes: _activeBatchManifest?.totalBytes ?? 0,
-        remainingSeconds: 0,
-        completedFiles: 0,
-        totalFiles: _activeBatchManifest?.totalFiles ?? 1,
-        currentFileName: _activeFileInfo?.name ?? '',
-        receiverProgressMap: Map.from(_hostReceiverProgress),
-      );
-      _emitSnapshot();
-
-      final pctInt = avg.clamp(0.0, 100.0).round();
-      BackgroundTransferService.instance.updateProgress(
-        title: 'FluxShare — Hosting Transfer [$pctInt%]',
-        message: 'Receivers downloading at $pctInt%',
-        progress: pctInt,
-        maxProgress: 100,
-      );
+      _updateHostSnapshot();
     } else if (type == 'TRANSFER_COMPLETED') {
       _hostReceiverProgress[peerId] = 100.0;
-      _currentSnapshot = TransferProgressSnapshot(
-        sessionId: _activeBatchManifest?.batchId ?? 'host_transfer',
-        isHost: true,
-        status: TransferStatus.completed,
-        progressPercent: 100.0,
-        speedMbPerSec: 0.0,
-        bytesTransferred: _activeBatchManifest?.totalBytes ?? 0,
-        totalBytes: _activeBatchManifest?.totalBytes ?? 0,
-        remainingSeconds: 0,
-        completedFiles: _activeBatchManifest?.totalFiles ?? 1,
-        totalFiles: _activeBatchManifest?.totalFiles ?? 1,
-        currentFileName: _activeFileInfo?.name ?? '',
-        receiverProgressMap: Map.from(_hostReceiverProgress),
+      if (_activeBatchManifest != null) {
+        _hostReceiverBytes[peerId] = _activeBatchManifest!.totalBytes;
+      }
+      _updateHostSnapshot();
+    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY' || type == 'RECEIVER_FAILED') {
+      _updateHostSnapshot();
+    }
+  }
+
+  void _updateHostSnapshot() {
+    if (_activeBatchManifest == null) return;
+
+    final connected = _activeServer?.connectedReceivers ?? [];
+    if (connected.isNotEmpty) {
+      final connectedPeerIds = connected.map((c) => c.peerId).toSet();
+      _hostReceiverProgress.removeWhere(
+        (k, v) => !connectedPeerIds.contains(k) && (!_hostReceiverBytes.containsKey(k) || _hostReceiverBytes[k] == 0),
       );
-      _emitSnapshot();
+    }
+
+    final totalBytes = _activeBatchManifest!.totalBytes;
+    final totalFiles = _activeBatchManifest!.totalFiles;
+
+    final avgProgress = _hostReceiverProgress.isNotEmpty
+        ? _hostReceiverProgress.values.reduce((a, b) => a + b) / _hostReceiverProgress.length
+        : 0.0;
+
+    final maxBytes = _hostReceiverBytes.isNotEmpty
+        ? _hostReceiverBytes.values.reduce((a, b) => a > b ? a : b)
+        : 0;
+
+    final totalSpeed = _hostReceiverSpeed.values.fold(0.0, (sum, s) => sum + s);
+    double effectiveSpeed = totalSpeed;
+    final now = DateTime.now();
+    if (_lastHostSnapshotTime != null && _lastHostBytesTransferred < maxBytes) {
+      final elapsedMs = now.difference(_lastHostSnapshotTime!).inMilliseconds;
+      if (elapsedMs > 200) {
+        final bytesDiff = maxBytes - _lastHostBytesTransferred;
+        final calculatedSpeed = (bytesDiff / (1024 * 1024)) / (elapsedMs / 1000.0);
+        if (calculatedSpeed > effectiveSpeed) {
+          effectiveSpeed = calculatedSpeed;
+        }
+      }
+    }
+    _lastHostSnapshotTime = now;
+    _lastHostBytesTransferred = maxBytes;
+
+    int remainingSec = 0;
+    final remainingBytes = totalBytes - maxBytes;
+    if (remainingBytes > 0 && effectiveSpeed > 0.05) {
+      remainingSec = (remainingBytes / (effectiveSpeed * 1024 * 1024)).ceil();
+    } else if (remainingBytes <= 0) {
+      remainingSec = 0;
+    } else {
+      remainingSec = -1;
+    }
+
+    final isAllCompleted = _hostReceiverProgress.isNotEmpty &&
+        _hostReceiverProgress.values.every((p) => p >= 100.0);
+
+    if (isAllCompleted) {
+      if (_hostCompletedEmitted) return;
+      _hostCompletedEmitted = true;
+      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      if (sId != null) {
+        unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+          sId,
+          reason: 'host_transfer_completed',
+        ));
+      }
+    }
+
+    _currentSnapshot = TransferProgressSnapshot(
+      sessionId: _activeBatchManifest!.batchId,
+      isHost: true,
+      status: isAllCompleted ? TransferStatus.completed : TransferStatus.transferring,
+      progressPercent: isAllCompleted ? 100.0 : avgProgress,
+      speedMbPerSec: isAllCompleted ? 0.0 : effectiveSpeed,
+      bytesTransferred: isAllCompleted ? totalBytes : maxBytes,
+      totalBytes: totalBytes,
+      remainingSeconds: isAllCompleted ? 0 : remainingSec,
+      completedFiles: isAllCompleted ? totalFiles : 0,
+      totalFiles: totalFiles,
+      currentFileName: _activeFileInfo?.name ?? '',
+      receiverProgressMap: Map.from(_hostReceiverProgress),
+      connectedReceivers: _activeServer?.connectedReceivers ?? [],
+    );
+    _emitSnapshot();
+
+    final pctInt = _currentSnapshot!.progressPercent.clamp(0.0, 100.0).round();
+    final speedStr = effectiveSpeed > 0
+        ? '${effectiveSpeed.toStringAsFixed(1)} MB/s'
+        : 'Connecting...';
+    final remainingStr = _currentSnapshot!.formattedRemainingTime;
+
+    BackgroundTransferService.instance.updateProgress(
+      title: isAllCompleted
+          ? 'FluxShare — Transfer Completed'
+          : 'FluxShare — Hosting Transfer [$pctInt%]',
+      message: isAllCompleted
+          ? 'All receivers finished downloading'
+          : '$speedStr • ETA: $remainingStr',
+      progress: pctInt,
+      maxProgress: 100,
+    );
+
+    if (isAllCompleted) {
       BackgroundTransferService.instance.stopForeground();
     }
   }
@@ -455,8 +559,20 @@ class TransferSessionManager {
       await _activeSingleEngine!.cancel();
       _activeSingleEngine = null;
     }
-    if (_isHost && _activeServer != null) {
-      _activeServer!.removeControlListener(_handleHostControlMessage);
+    if (_isHost) {
+      DiscoveryService().stopRoomHost();
+      RoomManager().expireRoom();
+      if (_activeServer != null) {
+        _activeServer!.clearBatch();
+        _activeServer!.removeControlListener(_handleHostControlMessage);
+      }
+      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      if (sId != null) {
+        await ManagedTemporaryFileService.instance.cleanupSession(
+          sId,
+          reason: 'host_session_cancelled',
+        );
+      }
     }
 
     await BackgroundTransferService.instance.stopForeground();
@@ -480,8 +596,22 @@ class TransferSessionManager {
   }
 
   void _cleanExistingSession() {
+    final oldSessionId = _activeSessionId ?? _activeBatchManifest?.batchId;
+    if (oldSessionId != null && _isHost) {
+      unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+        oldSessionId,
+        reason: 'host_session_replaced',
+      ));
+    }
     _activeSub?.cancel();
     _activeSub = null;
+    _serverReceiversSub?.cancel();
+    _serverReceiversSub = null;
+    _hostReceiverBytes.clear();
+    _hostReceiverSpeed.clear();
+    _lastHostSnapshotTime = null;
+    _lastHostBytesTransferred = 0;
+    _hostCompletedEmitted = false;
     if (_activeServer != null) {
       _activeServer!.removeControlListener(_handleHostControlMessage);
     }

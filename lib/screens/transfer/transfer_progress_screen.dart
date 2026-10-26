@@ -5,13 +5,17 @@ import '../../ai/ai_models.dart';
 import '../../ai/ai_service.dart';
 import '../../app/theme.dart';
 import '../../models/models.dart';
+import '../../models/connected_receiver.dart';
 import '../../network/local_server.dart';
+import '../../network/network_utils.dart';
 import '../../repositories/transfer_repository.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
 import '../../transfer/transfer_engine.dart';
 import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import 'transfer_complete_screen.dart';
+import '../../discovery/discovery_service.dart';
+import '../../room/room_manager.dart';
 
 class TransferProgressScreen extends StatefulWidget {
   final FileInfo? fileInfo;
@@ -70,6 +74,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
   bool _isPreviewReady = false;
   final Map<String, double> _receiverProgressMap = {};
+  List<ConnectedReceiver> _liveReceivers = [];
+  StreamSubscription<List<ConnectedReceiver>>? _liveReceiversSub;
+  bool _completionHandled = false;
+  bool _hasNavigatedToComplete = false;
 
   @override
   void initState() {
@@ -115,6 +123,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         _activeCoordinator = sessionManager.activeCoordinator;
       }
 
+      if (snap.connectedReceivers.isNotEmpty) {
+        _liveReceivers = snap.connectedReceivers;
+      }
       _sessionSub = sessionManager.progressStream.listen((snap) {
         if (!mounted) return;
         setState(() {
@@ -127,6 +138,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
           _batchItems = snap.items;
           _peerContributions = snap.peerChunkContributions;
           _receiverProgressMap.addAll(snap.receiverProgressMap);
+          if (snap.connectedReceivers.isNotEmpty) {
+            _liveReceivers = snap.connectedReceivers;
+          }
           if (snap.isPreviewReady) {
             _isPreviewReady = true;
           }
@@ -143,7 +157,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _bindBatchCoordinator(widget.batchCoordinator!);
     } else if (widget.engine != null) {
       _bindTransferEngine(widget.engine!);
-    } else if (widget.isHost) {
+    }
+
+    if (widget.isHost) {
       _bindHostControl();
     }
   }
@@ -239,6 +255,15 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
   void _bindHostControl() {
     final server = LocalServer();
+    if (_liveReceivers.isEmpty && server.connectedReceivers.isNotEmpty) {
+      _liveReceivers = server.connectedReceivers;
+    }
+    _liveReceiversSub ??= server.connectedReceiversStream.listen((list) {
+      if (!mounted) return;
+      setState(() {
+        _liveReceivers = list;
+      });
+    });
     server.addControlListener(_handleHostControlMessage);
   }
 
@@ -249,6 +274,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
     if (type == 'TRANSFER_PROGRESS') {
       final percent = (msg['percent'] as num?)?.toDouble() ?? 0.0;
+      final bytes = (msg['bytesTransferred'] as num?)?.toInt() ?? 0;
+      final speed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
+          (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
+
       setState(() {
         _receiverProgressMap[peerId] = percent;
         if (_receiverProgressMap.isNotEmpty) {
@@ -256,17 +285,41 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
               _receiverProgressMap.length;
           _progressPercent = avg;
         }
+        if (bytes > _bytesTransferred) {
+          _bytesTransferred = bytes;
+        }
+        if (speed > 0) {
+          _speedMbPerSec = speed;
+        }
       });
     } else if (type == 'TRANSFER_COMPLETED') {
       setState(() {
         _receiverProgressMap[peerId] = 100.0;
-        _progressPercent = 100.0;
+        if (_receiverProgressMap.isNotEmpty) {
+          final avg = _receiverProgressMap.values.reduce((a, b) => a + b) /
+              _receiverProgressMap.length;
+          _progressPercent = avg;
+        } else {
+          _progressPercent = 100.0;
+        }
       });
-      _onTransferSuccess();
+      // CRITICAL 1-TO-MANY FIX: For host, an individual receiver completing does NOT complete
+      // the transfer for everyone. The host completes only when TransferSessionManager determines
+      // that all receivers have finished (via progressStream).
+      if (!widget.isHost) {
+        _onTransferSuccess();
+      }
+    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY' || type == 'RECEIVER_FAILED') {
+      setState(() {
+        _liveReceivers = LocalServer().connectedReceivers;
+      });
     }
   }
 
   void _onTransferSuccess() {
+    if (_completionHandled) return;
+    _completionHandled = true;
+
     final totalFiles = _batchEvent?.totalFiles ??
         (widget.batchManifest?.totalFiles ?? 1);
 
@@ -299,6 +352,17 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     );
 
     TransferRepository().updateTransfer(transfer);
+
+    if (widget.isHost) {
+      LocalServer().removeControlListener(_handleHostControlMessage);
+      _liveReceiversSub?.cancel();
+      _liveReceiversSub = null;
+      _sessionSub?.cancel();
+      _sessionSub = null;
+      DiscoveryService().stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch(notify: false);
+    }
 
     if (mounted) {
       _navigateToComplete();
@@ -351,6 +415,41 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     }
   }
 
+  Future<void> _confirmCancel() async {
+    final shouldCancel = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: AppColors.backgroundWhite,
+        shape: AppShapes.cardShape,
+        title: const Text(
+          'Cancel Transfer?',
+          style: TextStyle(fontWeight: FontWeight.bold, color: AppColors.primaryBlack),
+        ),
+        content: const Text(
+          'Are you sure you want to cancel this transfer? Any partially transferred data will be discarded.',
+          style: TextStyle(fontSize: 13, color: AppColors.darkGray),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('No, Continue'),
+          ),
+          ElevatedButton(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: Colors.redAccent,
+              foregroundColor: Colors.white,
+            ),
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Yes, Cancel'),
+          ),
+        ],
+      ),
+    );
+    if (shouldCancel == true) {
+      await _cancelTransfer();
+    }
+  }
+
   Future<void> _cancelTransfer() async {
     if (_isCancelled) return;
     setState(() {
@@ -367,6 +466,12 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       await widget.engine!.cancel();
     }
 
+    if (widget.isHost) {
+      DiscoveryService().stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch();
+    }
+
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
@@ -379,7 +484,8 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   }
 
   void _navigateToComplete() {
-    if (!mounted) return;
+    if (!mounted || _hasNavigatedToComplete) return;
+    _hasNavigatedToComplete = true;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (context) => TransferCompleteScreen(
@@ -399,7 +505,11 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     _sessionSub?.cancel();
     _engineSub?.cancel();
     _batchSub?.cancel();
+    _liveReceiversSub?.cancel();
     if (widget.isHost) {
+      DiscoveryService().stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch();
       LocalServer().removeControlListener(_handleHostControlMessage);
     }
     super.dispose();
@@ -408,6 +518,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   String _formatRemainingTime() {
     if (_isPaused) return 'Paused';
     if (_progressPercent >= 100) return '00:00';
+    if (_speedMbPerSec <= 0.05 && _remainingSeconds <= 0) return '--:--';
     final mins = (_remainingSeconds ~/ 60).toString().padLeft(2, '0');
     final secs = (_remainingSeconds % 60).toString().padLeft(2, '0');
     return '$mins:$secs';
@@ -426,6 +537,98 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     if (_receiverDevices.isEmpty) return _progressPercent;
     final device = _receiverDevices[index];
     return _receiverProgressMap[device.id] ?? _progressPercent;
+  }
+
+  Widget _buildSessionStatusBadge() {
+    final String statusText;
+    final Color badgeBg;
+    final Color badgeFg;
+
+    if (_isCancelled) {
+      statusText = 'Cancelled';
+      badgeBg = Colors.grey.shade200;
+      badgeFg = AppColors.darkGray;
+    } else if (_isPaused) {
+      statusText = 'Paused';
+      badgeBg = Colors.orange.shade100;
+      badgeFg = Colors.orange.shade900;
+    } else if (_progressPercent >= 100) {
+      statusText = 'Completed';
+      badgeBg = Colors.green.shade100;
+      badgeFg = Colors.green.shade900;
+    } else if (widget.isHost && _liveReceivers.isEmpty && _receiverDevices.isEmpty) {
+      statusText = 'Waiting for Receivers';
+      badgeBg = Colors.amber.shade100;
+      badgeFg = Colors.amber.shade900;
+    } else {
+      statusText = 'Transferring';
+      badgeBg = Colors.blue.shade100;
+      badgeFg = Colors.blue.shade900;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: badgeBg,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: Text(
+        statusText,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+          color: badgeFg,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReceiverStatusPill(ReceiverStatus status) {
+    Color bg;
+    Color fg;
+    switch (status) {
+      case ReceiverStatus.joining:
+      case ReceiverStatus.connected:
+        bg = Colors.blue.shade100;
+        fg = Colors.blue.shade900;
+        break;
+      case ReceiverStatus.ready:
+        bg = Colors.green.shade100;
+        fg = Colors.green.shade900;
+        break;
+      case ReceiverStatus.receiving:
+        bg = Colors.indigo.shade100;
+        fg = Colors.indigo.shade900;
+        break;
+      case ReceiverStatus.completed:
+        bg = Colors.green.shade100;
+        fg = Colors.green.shade900;
+        break;
+      case ReceiverStatus.failed:
+        bg = Colors.red.shade100;
+        fg = Colors.red.shade900;
+        break;
+      case ReceiverStatus.disconnected:
+        bg = Colors.grey.shade200;
+        fg = AppColors.darkGray;
+        break;
+    }
+
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Text(
+        status.displayName,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          color: fg,
+        ),
+      ),
+    );
   }
 
   @override
@@ -448,15 +651,25 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         ? '0 MB/s'
         : _speedMbPerSec > 0
             ? '${_speedMbPerSec.toStringAsFixed(1)} MB/s'
-            : (_progressPercent >= 100 ? 'Done' : 'Connecting...');
+            : (_progressPercent >= 100 ? 'Done' : (widget.isHost ? 'Distributing...' : 'Connecting...'));
 
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,
       appBar: AppBar(
-        title: Text(
-          widget.isHost
-              ? (isBatch ? 'Distributing Batch...' : 'Distributing File...')
-              : (isBatch ? 'Receiving Batch...' : 'Receiving File...'),
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Flexible(
+              child: Text(
+                widget.isHost
+                    ? (isBatch ? 'Distributing Batch' : 'Distributing File')
+                    : (isBatch ? 'Receiving Batch' : 'Receiving File'),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            const SizedBox(width: 8),
+            _buildSessionStatusBadge(),
+          ],
         ),
         automaticallyImplyLeading: false,
         actions: [
@@ -475,7 +688,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                         title: const Text('Cancel Transfer'),
                         onTap: () {
                           Navigator.pop(context);
-                          _cancelTransfer();
+                          _confirmCancel();
                         },
                       ),
                     ],
@@ -506,14 +719,37 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                           borderRadius: BorderRadius.circular(8),
                           border: Border.all(color: AppColors.borderGray),
                         ),
-                        child: Text(
-                          'Room PIN: ${widget.roomPin}',
-                          style: const TextStyle(
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            letterSpacing: 2.0,
-                            color: AppColors.primaryBlack,
-                          ),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              'Room PIN: ${widget.roomPin}',
+                              style: const TextStyle(
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                letterSpacing: 2.0,
+                                color: AppColors.primaryBlack,
+                              ),
+                            ),
+                            if (widget.isHost && LocalServer().isRunning) ...[
+                              const SizedBox(height: 4),
+                              FutureBuilder<String?>(
+                                future: NetworkUtils.getLocalIpAddress(),
+                                builder: (context, snapshot) {
+                                  final ip = snapshot.data ?? '...';
+                                  final port = LocalServer().port;
+                                  return Text(
+                                    'Direct IP: $ip:$port',
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                      color: AppColors.mediumGray,
+                                    ),
+                                  );
+                                },
+                              ),
+                            ],
+                          ],
                         ),
                       ),
                       const SizedBox(height: AppSpacing.s16),
@@ -778,7 +1014,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                           ),
                           _buildStatColumn(
                             label: 'Receivers',
-                            value: '${_receiverDevices.length}',
+                            value: '${widget.isHost ? (_liveReceivers.isNotEmpty ? _liveReceivers.where((r) => r.status != ReceiverStatus.disconnected && r.status != ReceiverStatus.failed).length : _receiverDevices.length) : 1}',
                             icon: Icons.devices_rounded,
                           ),
                         ],
@@ -797,74 +1033,268 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                       const SizedBox(height: AppSpacing.s16),
                     ],
 
-                    // RECEIVER PROGRESS section
-                    if (_receiverDevices.isNotEmpty) ...[
-                      const SectionHeader(title: 'RECEIVER PROGRESS'),
-                      Column(
-                        children: List.generate(_receiverDevices.length, (index) {
-                          final device = _receiverDevices[index];
-                          final progress = _getReceiverProgress(index);
-                          return Container(
-                            margin: const EdgeInsets.only(bottom: AppSpacing.s12),
-                            padding: const EdgeInsets.all(AppSpacing.s16),
-                            decoration: BoxDecoration(
-                              color: AppColors.backgroundWhite,
-                              borderRadius: AppShapes.cardBorderRadius,
-                              border: Border.all(color: AppColors.borderGray),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Row(
-                                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                  children: [
-                                    Row(
-                                      children: [
-                                        Icon(
-                                          device.platform == DevicePlatform.iPhone
-                                              ? Icons.phone_iphone_rounded
-                                              : Icons.phone_android_rounded,
-                                          size: 18,
-                                          color: AppColors.primaryBlack,
-                                        ),
-                                        const SizedBox(width: AppSpacing.s8),
-                                        Text(
-                                          device.name,
-                                          style: const TextStyle(
-                                            fontSize: 14,
-                                            fontWeight: FontWeight.w600,
+                    // RECEIVER PROGRESS / PEER section
+                    if (widget.isHost) ...[
+                      const SectionHeader(title: 'CONNECTED RECEIVERS'),
+                      if (_liveReceivers.isNotEmpty) ...[
+                        Column(
+                          children: _liveReceivers.map((receiver) {
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: AppSpacing.s12),
+                              padding: const EdgeInsets.all(AppSpacing.s16),
+                              decoration: BoxDecoration(
+                                color: AppColors.backgroundWhite,
+                                borderRadius: AppShapes.cardBorderRadius,
+                                border: Border.all(color: AppColors.borderGray),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            receiver.platform == DevicePlatform.iPhone
+                                                ? Icons.phone_iphone_rounded
+                                                : Icons.phone_android_rounded,
+                                            size: 18,
                                             color: AppColors.primaryBlack,
                                           ),
-                                        ),
-                                      ],
-                                    ),
-                                    Text(
-                                      '${progress.toInt()}%',
-                                      style: const TextStyle(
-                                        fontSize: 14,
-                                        fontWeight: FontWeight.bold,
-                                        color: AppColors.primaryBlack,
+                                          const SizedBox(width: AppSpacing.s8),
+                                          Text(
+                                            receiver.deviceName,
+                                            style: const TextStyle(
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.w600,
+                                              color: AppColors.primaryBlack,
+                                            ),
+                                          ),
+                                          const SizedBox(width: 8),
+                                          _buildReceiverStatusPill(receiver.status),
+                                        ],
                                       ),
+                                      Text(
+                                        '${receiver.progressPercent.toInt()}%',
+                                        style: const TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.bold,
+                                          color: AppColors.primaryBlack,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: AppSpacing.s12),
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(4.0),
+                                    child: LinearProgressIndicator(
+                                      value: (receiver.progressPercent / 100.0).clamp(0.0, 1.0),
+                                      backgroundColor: AppColors.lightGray,
+                                      valueColor: AlwaysStoppedAnimation<Color>(
+                                        receiver.status == ReceiverStatus.failed
+                                            ? Colors.redAccent
+                                            : (receiver.status == ReceiverStatus.completed
+                                                ? Colors.green
+                                                : AppColors.primaryBlack),
+                                      ),
+                                      minHeight: 8,
+                                    ),
+                                  ),
+                                  if (receiver.errorMessage != null) ...[
+                                    const SizedBox(height: 6),
+                                    Text(
+                                      receiver.errorMessage!,
+                                      style: const TextStyle(fontSize: 11, color: Colors.redAccent),
+                                    ),
+                                  ] else if (receiver.bytesReceived > 0) ...[
+                                    const SizedBox(height: 4),
+                                    Text(
+                                      _formatBytes(receiver.bytesReceived),
+                                      style: const TextStyle(fontSize: 11, color: AppColors.mediumGray),
                                     ),
                                   ],
-                                ),
-                                const SizedBox(height: AppSpacing.s12),
-                                ClipRRect(
-                                  borderRadius: BorderRadius.circular(4.0),
-                                  child: LinearProgressIndicator(
-                                    value: (progress / 100.0).clamp(0.0, 1.0),
-                                    backgroundColor: AppColors.lightGray,
-                                    valueColor: const AlwaysStoppedAnimation<Color>(
-                                      AppColors.primaryBlack,
+                                ],
+                              ),
+                            );
+                          }).toList(),
+                        ),
+                      ] else if (_receiverDevices.isNotEmpty) ...[
+                        Column(
+                          children: List.generate(_receiverDevices.length, (index) {
+                            final device = _receiverDevices[index];
+                            final progress = _getReceiverProgress(index);
+                            return Container(
+                              margin: const EdgeInsets.only(bottom: AppSpacing.s12),
+                              padding: const EdgeInsets.all(AppSpacing.s16),
+                              decoration: BoxDecoration(
+                                color: AppColors.backgroundWhite,
+                                borderRadius: AppShapes.cardBorderRadius,
+                                border: Border.all(color: AppColors.borderGray),
+                              ),
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Row(
+                                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Icon(
+                                            device.platform == DevicePlatform.iPhone
+                                                ? Icons.phone_iphone_rounded
+                                                : Icons.phone_android_rounded,
+                                            size: 18,
+                                            color: AppColors.primaryBlack,
+                                          ),
+                                          const SizedBox(width: AppSpacing.s8),
+                                          Text(
+                                            device.name,
+                                            style: const TextStyle(
+                                              fontSize: 14,
+                                              fontWeight: FontWeight.w600,
+                                              color: AppColors.primaryBlack,
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      Text(
+                                        '${progress.toInt()}%',
+                                        style: const TextStyle(
+                                          fontSize: 14,
+                                          fontWeight: FontWeight.bold,
+                                          color: AppColors.primaryBlack,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                  const SizedBox(height: AppSpacing.s12),
+                                  ClipRRect(
+                                    borderRadius: BorderRadius.circular(4.0),
+                                    child: LinearProgressIndicator(
+                                      value: (progress / 100.0).clamp(0.0, 1.0),
+                                      backgroundColor: AppColors.lightGray,
+                                      valueColor: const AlwaysStoppedAnimation<Color>(
+                                        AppColors.primaryBlack,
+                                      ),
+                                      minHeight: 8,
                                     ),
-                                    minHeight: 8,
+                                  ),
+                                ],
+                              ),
+                            );
+                          }),
+                        ),
+                      ] else ...[
+                        Container(
+                          width: double.infinity,
+                          padding: const EdgeInsets.all(AppSpacing.s16),
+                          decoration: BoxDecoration(
+                            color: AppColors.lightGray,
+                            borderRadius: AppShapes.cardBorderRadius,
+                            border: Border.all(color: AppColors.borderGray),
+                          ),
+                          child: const Row(
+                            children: [
+                              SizedBox(
+                                width: 16,
+                                height: 16,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                  color: AppColors.primaryBlack,
+                                ),
+                              ),
+                              SizedBox(width: AppSpacing.s12),
+                              Expanded(
+                                child: Text(
+                                  'Waiting for receivers to join with Room PIN...',
+                                  style: TextStyle(
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w500,
+                                    color: AppColors.darkGray,
                                   ),
                                 ),
-                              ],
+                              ),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: AppSpacing.s16),
+                      ],
+                    ] else ...[
+                      // Receiver Screen: Host Peer Card
+                      const SectionHeader(title: 'SENDER CONNECTION'),
+                      Container(
+                        padding: const EdgeInsets.all(AppSpacing.s16),
+                        decoration: BoxDecoration(
+                          color: AppColors.backgroundWhite,
+                          borderRadius: AppShapes.cardBorderRadius,
+                          border: Border.all(color: AppColors.borderGray),
+                        ),
+                        child: Row(
+                          children: [
+                            Container(
+                              width: 36,
+                              height: 36,
+                              decoration: const BoxDecoration(
+                                color: AppColors.primaryBlack,
+                                shape: BoxShape.circle,
+                              ),
+                              child: const Icon(
+                                Icons.hub_rounded,
+                                color: AppColors.backgroundWhite,
+                                size: 18,
+                              ),
                             ),
-                          );
-                        }),
+                            const SizedBox(width: AppSpacing.s12),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(
+                                    widget.roomPin != null
+                                        ? 'Host Peer (Room PIN: ${widget.roomPin})'
+                                        : 'Host Peer',
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.bold,
+                                      fontSize: 13,
+                                    ),
+                                  ),
+                                  const SizedBox(height: 2),
+                                  Text(
+                                    _progressPercent >= 100
+                                        ? 'Transfer complete & verified'
+                                        : (_isPaused ? 'Paused' : 'Downloading verified chunks...'),
+                                    style: const TextStyle(
+                                      fontSize: 12,
+                                      color: AppColors.mediumGray,
+                                    ),
+                                  ),
+                                ],
+                              ),
+                            ),
+                            Container(
+                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                              decoration: BoxDecoration(
+                                color: _progressPercent >= 100
+                                    ? Colors.green.shade100
+                                    : Colors.blue.shade100,
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                              child: Text(
+                                _progressPercent >= 100 ? 'Verified' : 'Connected',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.bold,
+                                  color: _progressPercent >= 100
+                                      ? Colors.green.shade900
+                                      : Colors.blue.shade900,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
                       ),
+                      const SizedBox(height: AppSpacing.s16),
                     ],
                     if (widget.engine != null) ...[
                       const SizedBox(height: AppSpacing.s16),
@@ -944,7 +1374,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                     child: SecondaryButton(
                       text: 'CANCEL',
                       icon: Icons.close_rounded,
-                      onPressed: _cancelTransfer,
+                      onPressed: _confirmCancel,
                     ),
                   ),
                 ],

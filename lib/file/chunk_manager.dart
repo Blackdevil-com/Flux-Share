@@ -57,6 +57,31 @@ class ChunkWriterSession {
     _isOpen = true;
   }
 
+  /// Safely writes verified chunk buffers sequentially at [offset] in a single disk operation.
+  Future<void> writeVerifiedChunk(int offset, List<List<int>> buffers) {
+    if (!_isOpen || _raf == null) {
+      return Future.error(StateError('Writer session is not open'));
+    }
+
+    final completer = Completer<void>();
+    _writeQueue = _writeQueue.catchError((_) {}).then((_) async {
+      try {
+        if (_raf != null && _isOpen) {
+          await _raf!.setPosition(offset);
+          for (final buf in buffers) {
+            await _raf!.writeFrom(buf);
+          }
+          await _raf!.flush();
+        }
+        completer.complete();
+      } catch (e, st) {
+        completer.completeError(e, st);
+      }
+    });
+
+    return completer.future;
+  }
+
   /// Sequentially writes a chunk at [offset] with thread-safe file positioning.
   Future<void> writeChunk(int offset, List<int> bytes) {
     if (!_isOpen || _raf == null) {

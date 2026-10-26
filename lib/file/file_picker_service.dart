@@ -1,6 +1,5 @@
-import 'dart:convert';
+import '../services/managed_temporary_file_service.dart';
 import 'dart:io';
-import 'package:crypto/crypto.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import '../models/file_info.dart' as fi;
@@ -13,6 +12,8 @@ class SelectedFilePayload {
   final String extension;
   final fi.FileType type;
   final String? identifier;
+  final bool isManaged;
+  final String? sessionId;
 
   const SelectedFilePayload({
     required this.file,
@@ -21,6 +22,8 @@ class SelectedFilePayload {
     required this.extension,
     required this.type,
     this.identifier,
+    this.isManaged = false,
+    this.sessionId,
   });
 
   fi.FileInfo toFileInfo() {
@@ -52,7 +55,9 @@ class FilePickerService {
 
   /// Selects a single replacement file and immediately returns a lightweight metadata payload
   /// without requiring expensive synchronous disk I/O.
-  static Future<SelectedFilePayload?> pickSingleFilePayload() async {
+  static Future<SelectedFilePayload?> pickSingleFilePayload({String? sessionId}) async {
+    final effectiveSessionId = sessionId ?? 'single_picker_${DateTime.now().millisecondsSinceEpoch}';
+
     if (customSinglePayloadPickerHandler != null) {
       final payload = await customSinglePayloadPickerHandler!();
       debugPrint('[FluxShare] Single picker returned payload: ${payload?.name}');
@@ -74,6 +79,8 @@ class FilePickerService {
         sizeBytes: size,
         extension: ext,
         type: fi.FileInfo.detectFileType(ext),
+        isManaged: false,
+        sessionId: effectiveSessionId,
       );
     }
 
@@ -92,41 +99,29 @@ class FilePickerService {
 
       final f = result.files.first;
       final String? identifier = f.identifier;
-      File? resolvedFile;
-      if (f.path != null && f.path!.isNotEmpty) {
-        resolvedFile = File(f.path!);
-      } else if (f.readStream != null) {
-        final tempDir = Directory.systemTemp;
-        final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-        final sink = resolvedFile.openWrite();
-        await f.readStream!.pipe(sink);
-        debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
-      } else if (f.bytes != null) {
-        final tempDir = Directory.systemTemp;
-        final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-        await resolvedFile.writeAsBytes(f.bytes!, flush: true);
-        debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
-      }
+      final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
 
-      if (resolvedFile != null) {
-        final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
-        int size = f.size;
-        if (size <= 0 && resolvedFile.existsSync()) {
-          try {
-            size = resolvedFile.lengthSync();
-          } catch (_) {}
-        }
-        return SelectedFilePayload(
-          file: resolvedFile,
-          name: f.name,
-          sizeBytes: size,
-          extension: ext,
-          type: fi.FileInfo.detectFileType(ext),
-          identifier: identifier,
-        );
-      }
+      final managedRef = await ManagedTemporaryFileService.instance.getOrCreateManagedCopy(
+        sessionId: effectiveSessionId,
+        fileId: identifier ?? f.name,
+        name: f.name,
+        sizeBytes: f.size,
+        path: f.path,
+        readStream: f.readStream,
+        bytes: f.bytes,
+        identifier: identifier,
+      );
+
+      return SelectedFilePayload(
+        file: managedRef.file,
+        name: f.name,
+        sizeBytes: managedRef.sizeBytes,
+        extension: ext,
+        type: fi.FileInfo.detectFileType(ext),
+        identifier: identifier,
+        isManaged: managedRef.isManaged,
+        sessionId: effectiveSessionId,
+      );
     } catch (e, stack) {
       debugPrint('[FluxShare] FilePickerService.pickSingleFilePayload error: $e\n$stack');
     }
@@ -140,7 +135,9 @@ class FilePickerService {
 
   /// Selects multiple files and immediately returns lightweight metadata payloads
   /// without requiring expensive synchronous disk I/O.
-  static Future<List<SelectedFilePayload>> pickMultipleFilePayloads() async {
+  static Future<List<SelectedFilePayload>> pickMultipleFilePayloads({String? sessionId}) async {
+    final effectiveSessionId = sessionId ?? 'multi_picker_${DateTime.now().millisecondsSinceEpoch}';
+
     if (customPayloadPickerHandler != null) {
       final payloads = await customPayloadPickerHandler!();
       debugPrint('[FluxShare] Picker returned: ${payloads.length} payloads');
@@ -163,6 +160,8 @@ class FilePickerService {
           sizeBytes: size,
           extension: ext,
           type: fi.FileInfo.detectFileType(ext),
+          isManaged: false,
+          sessionId: effectiveSessionId,
         );
       }).toList();
     }
@@ -184,52 +183,32 @@ class FilePickerService {
       final List<SelectedFilePayload> payloads = [];
       for (final f in result.files) {
         final String? identifier = f.identifier;
-        File? resolvedFile;
-        if (f.path != null && f.path!.isNotEmpty) {
-          resolvedFile = File(f.path!);
-        } else if (f.readStream != null) {
-          final tempDir = Directory.systemTemp;
-          final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-          final stableKey = identifier != null
-              ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
-              : '${f.size}';
-          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
-          if (!await resolvedFile.exists()) {
-            final sink = resolvedFile.openWrite();
-            await f.readStream!.pipe(sink);
-          }
-          debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
-        } else if (f.bytes != null) {
-          final tempDir = Directory.systemTemp;
-          final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-          final stableKey = identifier != null
-              ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
-              : '${f.size}';
-          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
-          if (!await resolvedFile.exists()) {
-            await resolvedFile.writeAsBytes(f.bytes!, flush: true);
-          }
-          debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
-        }
+        final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
 
-        if (resolvedFile != null) {
-          final ext = f.extension ?? (f.name.contains('.') ? f.name.split('.').last.toLowerCase() : '');
-          int size = f.size;
-          if (size <= 0 && resolvedFile.existsSync()) {
-            try {
-              size = resolvedFile.lengthSync();
-            } catch (_) {}
-          }
-          payloads.add(SelectedFilePayload(
-            file: resolvedFile,
+        try {
+          final managedRef = await ManagedTemporaryFileService.instance.getOrCreateManagedCopy(
+            sessionId: effectiveSessionId,
+            fileId: identifier ?? f.name,
             name: f.name,
-            sizeBytes: size,
+            sizeBytes: f.size,
+            path: f.path,
+            readStream: f.readStream,
+            bytes: f.bytes,
+            identifier: identifier,
+          );
+
+          payloads.add(SelectedFilePayload(
+            file: managedRef.file,
+            name: f.name,
+            sizeBytes: managedRef.sizeBytes,
             extension: ext,
             type: fi.FileInfo.detectFileType(ext),
             identifier: identifier,
+            isManaged: managedRef.isManaged,
+            sessionId: effectiveSessionId,
           ));
-        } else {
-          debugPrint('[FluxShare] Warning: Picked file "${f.name}" has neither path nor bytes available.');
+        } catch (fileErr) {
+          debugPrint('[FluxShare] Warning: Could not resolve picked file "${f.name}": $fileErr');
         }
       }
 

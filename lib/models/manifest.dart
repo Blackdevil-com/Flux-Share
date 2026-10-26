@@ -11,6 +11,15 @@ class Manifest {
   final String fileSha256;
   final List<ChunkMeta> chunks;
 
+  String get formattedSize {
+    if (fileSize < 1024) return '$fileSize B';
+    if (fileSize < 1024 * 1024) return '${(fileSize / 1024).toStringAsFixed(1)} KB';
+    if (fileSize < 1024 * 1024 * 1024) {
+      return '${(fileSize / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(fileSize / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+  }
+
   const Manifest({
     required this.fileId,
     required this.fileName,

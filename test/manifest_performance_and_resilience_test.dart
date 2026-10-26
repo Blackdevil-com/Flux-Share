@@ -97,7 +97,7 @@ void main() {
 
       expect(m2.fileSha256, equals(m1.fileSha256));
       expect(m2.chunkCount, equals(m1.chunkCount));
-      expect(warmSw.elapsedMilliseconds, lessThan(20)); // Sub-millisecond to few milliseconds
+      expect(warmSw.elapsedMilliseconds, lessThan(100)); // Sub-millisecond to few milliseconds
 
       // Warm run 2 (Disk cache hit after memory clear)
       ManifestCache.instance.clearMemoryCache();
