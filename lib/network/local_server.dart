@@ -12,6 +12,7 @@ import '../models/connected_receiver.dart';
 import '../models/device.dart';
 import '../models/manifest.dart';
 import '../models/peer.dart';
+import '../services/managed_temporary_file_service.dart';
 import 'network_utils.dart';
 
 typedef ControlMessageHandler = void Function(Map<String, dynamic> message);
@@ -162,6 +163,11 @@ class LocalServer {
         listener(msg);
       } catch (_) {}
     }
+  }
+
+  @visibleForTesting
+  void notifyControlListenersForTesting(Map<String, dynamic> msg) {
+    _notifyControlListeners(msg);
   }
 
   void _recordChunkServed({
@@ -439,8 +445,32 @@ class LocalServer {
         return Response.notFound('Chunk $chunkId not found in manifest');
       }
 
+      final activeBatchId = _activeBatchId ?? '';
+      ManagedTemporaryFileService.instance.registerActiveUse(
+        activeBatchId,
+        file.path,
+      );
       try {
-        final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        final rawStream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        final stream = rawStream.transform(
+          StreamTransformer<List<int>, List<int>>.fromHandlers(
+            handleData: (data, sink) => sink.add(data),
+            handleDone: (sink) {
+              unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+                activeBatchId,
+                file.path,
+              ));
+              sink.close();
+            },
+            handleError: (error, stackTrace, sink) {
+              unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+                activeBatchId,
+                file.path,
+              ));
+              sink.addError(error, stackTrace);
+            },
+          ),
+        );
         _recordChunkServed(
           request: request,
           fileId: activeFileId,
@@ -456,6 +486,10 @@ class LocalServer {
           },
         );
       } catch (e) {
+        unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+          activeBatchId,
+          file.path,
+        ));
         debugPrint('[FluxShare-Server] [500] Error reading chunk $chunkId for file $fileId: $e');
         return Response.internalServerError(body: 'Error reading chunk: $e');
       }
@@ -493,9 +527,33 @@ class LocalServer {
         return Response.notFound('Chunk $chunkId not found');
       }
 
+      final activeBatchId = _activeBatchId ?? '';
+      ManagedTemporaryFileService.instance.registerActiveUse(
+        activeBatchId,
+        file.path,
+      );
       try {
         // Zero-buffer direct disk streaming to socket
-        final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        final rawStream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        final stream = rawStream.transform(
+          StreamTransformer<List<int>, List<int>>.fromHandlers(
+            handleData: (data, sink) => sink.add(data),
+            handleDone: (sink) {
+              unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+                activeBatchId,
+                file.path,
+              ));
+              sink.close();
+            },
+            handleError: (error, stackTrace, sink) {
+              unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+                activeBatchId,
+                file.path,
+              ));
+              sink.addError(error, stackTrace);
+            },
+          ),
+        );
         _recordChunkServed(
           request: request,
           fileId: m.fileId,
@@ -511,6 +569,10 @@ class LocalServer {
           },
         );
       } catch (e) {
+        unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+          activeBatchId,
+          file.path,
+        ));
         debugPrint('[FluxShare-Server] [500] Error reading legacy chunk $chunkId: $e');
         return Response.internalServerError(body: 'Error reading chunk: $e');
       }

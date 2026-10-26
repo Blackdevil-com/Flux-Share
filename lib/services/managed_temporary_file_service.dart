@@ -377,6 +377,15 @@ class ManagedTemporaryFileService {
         continue;
       }
 
+      // If another active session also references this file, do not delete it
+      final isUsedByOtherSession = _sessionFiles.entries.any(
+        (entry) => entry.key != sessionId && entry.value.contains(path),
+      );
+      if (isUsedByOtherSession) {
+        debugPrint('[FluxShare-Storage] Retained managed file $path during cleanup: still referenced by another active session');
+        continue;
+      }
+
       if (ref.activeReaderCount > 0) {
         ref.markedForDeletion = true;
         ref.deletionReason = reason;
@@ -470,13 +479,16 @@ class ManagedTemporaryFileService {
   }
 
   Future<int> _deleteManagedFile(ManagedFileReference ref, String reason) async {
-    _managedFiles.remove(ref.path);
     int freed = 0;
     try {
       if (await ref.file.exists()) {
         freed = await ref.file.length();
         await ref.file.delete();
         debugPrint('[FluxShare-Storage] Deleted managed temp file: ${ref.path} (freed $freed bytes, reason: $reason)');
+      }
+      _managedFiles.remove(ref.path);
+      for (final files in _sessionFiles.values) {
+        files.remove(ref.path);
       }
       await StorageDiagnosticsService().releaseTempFile(ref.path);
     } catch (e) {
