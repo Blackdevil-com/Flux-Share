@@ -20,6 +20,7 @@ import '../../room/room_manager.dart';
 import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
 import '../transfer/transfer_progress_screen.dart';
+import '../../services/managed_temporary_file_service.dart';
 
 enum FilePreparationStatus {
   selected,
@@ -49,6 +50,8 @@ class PickedFileItem {
   String? errorMessage;
   bool isCancelled;
   final String? identifier;
+  final bool isManaged;
+  final String? sessionId;
   final ValueNotifier<ManifestProgress?> progressNotifier;
 
   PickedFileItem({
@@ -62,6 +65,8 @@ class PickedFileItem {
     this.errorMessage,
     this.isCancelled = false,
     this.identifier,
+    this.isManaged = false,
+    this.sessionId,
   }) : progressNotifier = ValueNotifier<ManifestProgress?>(progress);
 
   bool get isReady => status.isManifestReady && manifest != null;
@@ -74,6 +79,8 @@ class PickedFileItem {
       extension: info.extension,
       type: info.type,
       identifier: identifier,
+      isManaged: isManaged,
+      sessionId: sessionId,
     );
   }
 }
@@ -111,6 +118,7 @@ class SendFileScreen extends StatefulWidget {
 }
 
 class _SendFileScreenState extends State<SendFileScreen> {
+  late final String _sessionId;
   final DeviceRepository _deviceRepository = DeviceRepository();
   final DiscoveryService _discoveryService = DiscoveryService();
   final List<PickedFileItem> _selectedFiles = [];
@@ -131,6 +139,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   @override
   void initState() {
     super.initState();
+    _sessionId = 'send_session_${DateTime.now().millisecondsSinceEpoch}_${Random().nextInt(9999)}';
     _generateRoomPin();
     if (widget.initialPickedItems != null && widget.initialPickedItems!.isNotEmpty) {
       _selectedFiles.addAll(widget.initialPickedItems!);
@@ -165,14 +174,27 @@ class _SendFileScreenState extends State<SendFileScreen> {
       item.isCancelled = true;
       item.jobId++;
       item.progressNotifier.dispose();
+      if (item.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+          item.sessionId ?? _sessionId,
+          item.file.path,
+          reason: 'user_cleared_all_files',
+        ));
+      }
     }
     _sessionCache.clear();
     _manifestUpdateNotifier.dispose();
     _receiversSub?.cancel();
-    if (!_navigatedToTransfer && _isHostingStarted) {
-      _discoveryService.stopRoomHost();
-      RoomManager().expireRoom();
-      LocalServer().clearBatch();
+    if (!_navigatedToTransfer) {
+      if (_isHostingStarted) {
+        _discoveryService.stopRoomHost();
+        RoomManager().expireRoom();
+        LocalServer().clearBatch();
+      }
+      unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+        _sessionId,
+        reason: 'send_file_screen_disposed_before_transfer',
+      ));
     }
     super.dispose();
   }
@@ -250,7 +272,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   /// Opens the native multi-file picker to add more files to the selection.
   Future<void> _openFileBrowser() async {
     try {
-      final payloads = await FilePickerService.pickMultipleFilePayloads();
+      final payloads = await FilePickerService.pickMultipleFilePayloads(sessionId: _sessionId);
       if (payloads.isEmpty) {
         debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
         return;
@@ -285,6 +307,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
           info: payload.toFileInfo(),
           status: FilePreparationStatus.selected,
           identifier: payload.identifier,
+          isManaged: payload.isManaged,
+          sessionId: payload.sessionId ?? _sessionId,
         );
         _selectedFiles.add(item);
         addedCount++;
@@ -326,7 +350,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   /// preserves valid manifests for unchanged files, and applies confirmed changes.
   Future<void> _openChangeFlow() async {
     try {
-      final newPayloads = await FilePickerService.pickMultipleFilePayloads();
+      final newPayloads = await FilePickerService.pickMultipleFilePayloads(sessionId: _sessionId);
       if (newPayloads.isEmpty) {
         debugPrint('[FluxShare] Change flow cancelled by user; retaining existing selection.');
         return;
@@ -605,6 +629,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
         item.isCancelled = true;
         item.jobId++;
         item.progressNotifier.dispose();
+        if (item.isManaged) {
+          unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+            item.sessionId ?? _sessionId,
+            item.file.path,
+            reason: 'removed_in_change_review',
+          ));
+        }
         _selectedFiles.remove(item);
       }
     }
@@ -639,6 +670,8 @@ class _SendFileScreenState extends State<SendFileScreen> {
         info: item.payload.toFileInfo(),
         status: FilePreparationStatus.selected,
         identifier: item.payload.identifier,
+        isManaged: item.payload.isManaged,
+        sessionId: item.payload.sessionId ?? _sessionId,
       );
       _selectedFiles.add(newItem);
       newlyAddedCount++;
@@ -712,6 +745,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
       removed.isCancelled = true;
       removed.jobId++;
       removed.progressNotifier.dispose();
+      if (removed.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseTempFileForSession(
+          removed.sessionId ?? _sessionId,
+          removed.file.path,
+          reason: 'user_removed_file',
+        ));
+      }
       setState(() {
         _selectedFiles.removeAt(index);
       });
@@ -808,6 +848,13 @@ class _SendFileScreenState extends State<SendFileScreen> {
         _manifestUpdateNotifier.value++;
       }
 
+      if (targetItem.isManaged) {
+        ManagedTemporaryFileService.instance.registerActiveUse(
+          targetItem.sessionId ?? _sessionId,
+          targetItem.file.path,
+        );
+      }
+
       if (targetItem.isCancelled || targetItem.jobId != activeJobId) {
         outcome = 'cancelled_before_start';
         return;
@@ -888,6 +935,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
         }
       }
     } finally {
+      if (targetItem.isManaged) {
+        unawaited(ManagedTemporaryFileService.instance.releaseActiveUse(
+          targetItem.sessionId ?? _sessionId,
+          targetItem.file.path,
+        ));
+      }
       // CRITICAL: Always release worker slot regardless of how _processItem exits
       _activeWorkerJobIds.remove(activeJobId);
       debugPrint('[FluxShare-Diag] [B9:StateTransition] workerSlotReleased: jobId=$activeJobId, file=${targetItem.info.name}, remainingWorkers=${_activeWorkerJobIds.length}');
@@ -1067,11 +1120,17 @@ class _SendFileScreenState extends State<SendFileScreen> {
         sessionId: batchManifest.batchId,
       );
 
+      ManagedTemporaryFileService.instance.aliasSession(
+        sourceSessionId: _sessionId,
+        targetSessionId: batchManifest.batchId,
+      );
+
       await TransferSessionManager.instance.startHostSession(
         server: server,
         batchManifest: batchManifest,
         receivers: selectedDevices,
         roomPin: _roomPin,
+        sessionId: _sessionId,
       );
 
       _navigatedToTransfer = true;

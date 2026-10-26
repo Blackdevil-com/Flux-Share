@@ -8,6 +8,7 @@ import '../models/manifest.dart';
 import '../models/transfer.dart';
 import '../network/local_server.dart';
 import '../services/background_transfer_service.dart';
+import '../services/managed_temporary_file_service.dart';
 import 'batch_transfer_coordinator.dart';
 import 'transfer_engine.dart';
 import '../discovery/discovery_service.dart';
@@ -98,6 +99,7 @@ class TransferSessionManager {
   BatchManifest? _activeBatchManifest;
   Manifest? _activeManifest;
   String? _roomPin;
+  String? _activeSessionId;
   bool _isHost = false;
 
   TransferSessionManager._internal() {
@@ -131,10 +133,12 @@ class TransferSessionManager {
     required BatchManifest batchManifest,
     required List<Device> receivers,
     required String? roomPin,
+    String? sessionId,
   }) async {
     _cleanExistingSession();
 
     _isHost = true;
+    _activeSessionId = sessionId ?? batchManifest.batchId;
     _activeServer = server;
     _activeBatchManifest = batchManifest;
     _activeReceivers = receivers;
@@ -437,6 +441,17 @@ class TransferSessionManager {
     final isAllCompleted = _hostReceiverProgress.isNotEmpty &&
         _hostReceiverProgress.values.every((p) => p >= 100.0);
 
+    final wasAlreadyCompleted = _currentSnapshot?.status == TransferStatus.completed;
+    if (isAllCompleted && !wasAlreadyCompleted) {
+      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      if (sId != null) {
+        unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+          sId,
+          reason: 'host_transfer_completed',
+        ));
+      }
+    }
+
     _currentSnapshot = TransferProgressSnapshot(
       sessionId: _activeBatchManifest!.batchId,
       isHost: true,
@@ -518,6 +533,13 @@ class TransferSessionManager {
         _activeServer!.clearBatch();
         _activeServer!.removeControlListener(_handleHostControlMessage);
       }
+      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      if (sId != null) {
+        await ManagedTemporaryFileService.instance.cleanupSession(
+          sId,
+          reason: 'host_session_cancelled',
+        );
+      }
     }
 
     await BackgroundTransferService.instance.stopForeground();
@@ -541,6 +563,13 @@ class TransferSessionManager {
   }
 
   void _cleanExistingSession() {
+    final oldSessionId = _activeSessionId ?? _activeBatchManifest?.batchId;
+    if (oldSessionId != null && _isHost) {
+      unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+        oldSessionId,
+        reason: 'host_session_replaced',
+      ));
+    }
     _activeSub?.cancel();
     _activeSub = null;
     _serverReceiversSub?.cancel();

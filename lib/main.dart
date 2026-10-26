@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'ai/ai_service.dart';
 import 'app/app.dart';
@@ -8,9 +9,13 @@ import 'models/app_settings.dart';
 import 'network/local_server.dart';
 import 'peer/peer_manager.dart';
 import 'repositories/transfer_repository.dart';
+import 'services/managed_temporary_file_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  // Safely clean up any stale abandoned temporary files from previous crashed sessions
+  unawaited(ManagedTemporaryFileService.instance.cleanupStaleSessions());
 
   // Initialize persistence and managers
   await AppSettings().init();

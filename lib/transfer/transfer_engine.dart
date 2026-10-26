@@ -3,6 +3,7 @@ import '../services/storage_diagnostics_service.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'package:flutter/foundation.dart';
 import '../file/chunk_manager.dart';
 import '../file/chunk_persistence_manager.dart';
 import '../file/file_hasher.dart';
@@ -549,14 +550,16 @@ class TransferEngine {
     await _writerSession.close();
     _sharedDownloader.close();
 
-    // If cancelled before any verified chunks were committed, remove empty preallocated file
-    if (_verifiedChunks.isEmpty) {
-      try {
-        if (await destinationFile.exists()) {
-          await destinationFile.delete();
-        }
-      } catch (_) {}
-    }
+    // If cancelled before completion, remove incomplete destination file and checkpoint
+    try {
+      if (await destinationFile.exists()) {
+        await destinationFile.delete();
+        debugPrint('[FluxShare-Storage] Deleted incomplete receiver file upon cancellation: ');
+      }
+    } catch (_) {}
+    try {
+      await ChunkPersistenceManager().deleteCheckpoint(manifest.fileId);
+    } catch (_) {}
 
     try {
       webSocketService?.notifyTransferCancelled();

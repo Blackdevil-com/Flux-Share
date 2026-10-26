@@ -98,7 +98,9 @@ class StorageDiagnosticsService {
   void registerManagedTempFile(String path, [int sizeBytes = 0]) => registerTempFile(path, sizeBytes);
 
   bool isManagedTempFile(String path) =>
-      _activeTempFiles.contains(path) || path.contains('fluxshare_tmp_');
+      _activeTempFiles.contains(path) ||
+      path.contains('fluxshare_tmp_') ||
+      path.contains('fs_managed_');
 
   Future<int> cleanupManagedTempFiles({Directory? customTempDir, Duration? olderThan}) =>
       cleanStaleManagedTempFiles(targetDir: customTempDir, maxAge: olderThan ?? const Duration(hours: 24));
@@ -129,8 +131,9 @@ class StorageDiagnosticsService {
       await for (final entity in tempDir.list(followLinks: false)) {
         if (entity is File) {
           final fileName = entity.uri.pathSegments.last;
-          if (fileName.startsWith('fluxshare_tmp_') &&
-              !_activeTempFiles.contains(entity.path)) {
+          final isFluxShareTemp = fileName.startsWith('fluxshare_tmp_') ||
+              fileName.startsWith('fs_managed_');
+          if (isFluxShareTemp && !_activeTempFiles.contains(entity.path)) {
             try {
               final stat = await entity.stat();
               if (now.difference(stat.modified) > maxAge) {
