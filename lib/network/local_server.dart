@@ -82,6 +82,9 @@ class LocalServer {
     });
   }
 
+  final Map<String, Set<String>> _servedChunksByPeer = {};
+  final Map<String, int> _bytesServedByPeer = {};
+
   void updateReceiver(ConnectedReceiver receiver) {
     _connectedReceivers[receiver.peerId] = receiver;
     _connectedReceiversController.add(connectedReceivers);
@@ -90,6 +93,8 @@ class LocalServer {
   void clearReceivers() {
     _connectedReceivers.clear();
     _channelPeerMap.clear();
+    _servedChunksByPeer.clear();
+    _bytesServedByPeer.clear();
     _transferStarted = false;
     _connectedReceiversController.add([]);
   }
@@ -144,6 +149,97 @@ class LocalServer {
     _sourceFiles.clear();
     _verifiedChunksByFile.clear();
     verifiedChunks.clear();
+    _servedChunksByPeer.clear();
+    _bytesServedByPeer.clear();
+  }
+
+  void _notifyControlListeners(Map<String, dynamic> msg) {
+    for (final listener in List.of(_controlListeners)) {
+      try {
+        listener(msg);
+      } catch (_) {}
+    }
+  }
+
+  void _recordChunkServed({
+    required Request request,
+    required String fileId,
+    required int chunkId,
+    required int chunkBytes,
+  }) {
+    final headerPeerId = request.headers['x-peer-id'] ?? request.headers['X-Peer-Id'];
+
+    String? targetPeerId = headerPeerId;
+    if (targetPeerId == null || !_connectedReceivers.containsKey(targetPeerId)) {
+      if (_connectedReceivers.length == 1) {
+        targetPeerId = _connectedReceivers.keys.first;
+      } else {
+        String? clientIp;
+        final connInfo = request.context['shelf.io.connection_info'];
+        if (connInfo is HttpConnectionInfo) {
+          clientIp = connInfo.remoteAddress.address;
+        }
+        if (clientIp != null) {
+          try {
+            final match = _connectedReceivers.values.firstWhere(
+              (r) => r.ip == clientIp,
+            );
+            targetPeerId = match.peerId;
+          } catch (_) {}
+        }
+      }
+    }
+
+    if (targetPeerId == null) {
+      targetPeerId = headerPeerId ?? 'receiver_${_connectedReceivers.length + 1}';
+      _connectedReceivers[targetPeerId] = ConnectedReceiver(
+        peerId: targetPeerId,
+        deviceName: 'Receiver',
+        platform: DevicePlatform.Android,
+        status: ReceiverStatus.receiving,
+        progressPercent: 0.0,
+        bytesReceived: 0,
+        lastSeen: DateTime.now(),
+      );
+    }
+
+    final chunkKey = '$fileId:$chunkId';
+    final servedSet = _servedChunksByPeer.putIfAbsent(targetPeerId, () => <String>{});
+    final isNewChunk = servedSet.add(chunkKey);
+
+    if (isNewChunk) {
+      final currentBytes = (_bytesServedByPeer[targetPeerId] ?? 0) + chunkBytes;
+      _bytesServedByPeer[targetPeerId] = currentBytes;
+
+      final totalBytes = _manifests.values.fold(0, (sum, m) => sum + m.fileSize);
+      final pct = totalBytes > 0
+          ? ((currentBytes / totalBytes) * 100.0).clamp(0.0, 100.0)
+          : 0.0;
+
+      final existing = _connectedReceivers[targetPeerId];
+      if (existing != null) {
+        final effectiveBytes = currentBytes > existing.bytesReceived ? currentBytes : existing.bytesReceived;
+        final effectivePct = pct > existing.progressPercent ? pct : existing.progressPercent;
+        final isComplete = effectivePct >= 100.0;
+
+        _connectedReceivers[targetPeerId] = existing.copyWith(
+          status: isComplete ? ReceiverStatus.completed : ReceiverStatus.receiving,
+          progressPercent: effectivePct,
+          bytesReceived: effectiveBytes,
+          lastSeen: DateTime.now(),
+        );
+        _connectedReceiversController.add(connectedReceivers);
+
+        _notifyControlListeners({
+          'type': isComplete ? 'TRANSFER_COMPLETED' : 'TRANSFER_PROGRESS',
+          'sessionId': _activeBatchId ?? '',
+          'peerId': targetPeerId,
+          'percent': effectivePct,
+          'bytesTransferred': effectiveBytes,
+          'totalBytes': totalBytes,
+        });
+      }
+    }
   }
 
   /// Sets single manifest for backward compatibility by replacing the active batch.
@@ -339,6 +435,12 @@ class LocalServer {
 
       try {
         final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        _recordChunkServed(
+          request: request,
+          fileId: activeFileId,
+          chunkId: chunkId,
+          chunkBytes: chunk.length,
+        );
         return Response.ok(
           stream,
           headers: {
@@ -385,6 +487,12 @@ class LocalServer {
       try {
         // Zero-buffer direct disk streaming to socket
         final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
+        _recordChunkServed(
+          request: request,
+          fileId: m.fileId,
+          chunkId: chunkId,
+          chunkBytes: chunk.length,
+        );
         return Response.ok(
           stream,
           headers: {
@@ -521,11 +629,9 @@ class LocalServer {
               final pct = (parsed['percent'] as num?)?.toDouble() ?? 0.0;
               final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
               final existing = _connectedReceivers[activePeerId];
-              if (existing != null &&
-                  existing.status != ReceiverStatus.failed &&
-                  existing.status != ReceiverStatus.disconnected) {
+              if (existing != null && existing.status != ReceiverStatus.failed) {
                 _connectedReceivers[activePeerId] = existing.copyWith(
-                  status: ReceiverStatus.receiving,
+                  status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
                   progressPercent: pct,
                   bytesReceived: bytes,
                   lastSeen: DateTime.now(),
@@ -557,9 +663,7 @@ class LocalServer {
               }
             }
 
-            for (final listener in List.of(_controlListeners)) {
-              listener(parsed);
-            }
+            _notifyControlListeners(parsed);
           } catch (_) {}
         },
         onDone: () {

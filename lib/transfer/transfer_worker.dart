@@ -27,6 +27,7 @@ typedef SelectWorkCallback = ({ChunkMeta chunk, PeerInfo peer})? Function(String
 class TransferWorker {
   final String workerId;
   final String? fileId;
+  final String? localPeerId;
   final ReservationManager reservationManager;
   final ChunkWriterSession writerSession;
   final ChunkDownloader downloader;
@@ -41,6 +42,7 @@ class TransferWorker {
   TransferWorker({
     required this.workerId,
     this.fileId,
+    this.localPeerId,
     required this.reservationManager,
     required this.writerSession,
     required this.downloader,
@@ -111,6 +113,7 @@ class TransferWorker {
           chunkMeta: chunk,
           writerSession: writerSession,
           fileId: fileId,
+          localPeerId: localPeerId,
           allowLegacyFallback: true,
         );
       } catch (e) {

@@ -101,6 +101,8 @@ class TransferSessionManager {
   String? _roomPin;
   String? _activeSessionId;
   bool _isHost = false;
+  DateTime? _lastHostSnapshotTime;
+  int _lastHostBytesTransferred = 0;
 
   TransferSessionManager._internal() {
     BackgroundTransferService.instance.addCancelListener(() {
@@ -157,6 +159,8 @@ class TransferSessionManager {
     _hostReceiverProgress.clear();
     _hostReceiverBytes.clear();
     _hostReceiverSpeed.clear();
+    _lastHostSnapshotTime = null;
+    _lastHostBytesTransferred = 0;
     for (final r in receivers) {
       _hostReceiverProgress[r.id] = 0.0;
     }
@@ -419,6 +423,14 @@ class TransferSessionManager {
   void _updateHostSnapshot() {
     if (_activeBatchManifest == null) return;
 
+    final connected = _activeServer?.connectedReceivers ?? [];
+    if (connected.isNotEmpty) {
+      final connectedPeerIds = connected.map((c) => c.peerId).toSet();
+      _hostReceiverProgress.removeWhere(
+        (k, v) => !connectedPeerIds.contains(k) && (!_hostReceiverBytes.containsKey(k) || _hostReceiverBytes[k] == 0),
+      );
+    }
+
     final totalBytes = _activeBatchManifest!.totalBytes;
     final totalFiles = _activeBatchManifest!.totalFiles;
 
@@ -431,11 +443,29 @@ class TransferSessionManager {
         : 0;
 
     final totalSpeed = _hostReceiverSpeed.values.fold(0.0, (sum, s) => sum + s);
+    double effectiveSpeed = totalSpeed;
+    final now = DateTime.now();
+    if (_lastHostSnapshotTime != null && _lastHostBytesTransferred < maxBytes) {
+      final elapsedMs = now.difference(_lastHostSnapshotTime!).inMilliseconds;
+      if (elapsedMs > 200) {
+        final bytesDiff = maxBytes - _lastHostBytesTransferred;
+        final calculatedSpeed = (bytesDiff / (1024 * 1024)) / (elapsedMs / 1000.0);
+        if (calculatedSpeed > effectiveSpeed) {
+          effectiveSpeed = calculatedSpeed;
+        }
+      }
+    }
+    _lastHostSnapshotTime = now;
+    _lastHostBytesTransferred = maxBytes;
 
     int remainingSec = 0;
     final remainingBytes = totalBytes - maxBytes;
-    if (remainingBytes > 0 && totalSpeed > 0.05) {
-      remainingSec = (remainingBytes / (totalSpeed * 1024 * 1024)).ceil();
+    if (remainingBytes > 0 && effectiveSpeed > 0.05) {
+      remainingSec = (remainingBytes / (effectiveSpeed * 1024 * 1024)).ceil();
+    } else if (remainingBytes <= 0) {
+      remainingSec = 0;
+    } else {
+      remainingSec = -1;
     }
 
     final isAllCompleted = _hostReceiverProgress.isNotEmpty &&
@@ -457,7 +487,7 @@ class TransferSessionManager {
       isHost: true,
       status: isAllCompleted ? TransferStatus.completed : TransferStatus.transferring,
       progressPercent: isAllCompleted ? 100.0 : avgProgress,
-      speedMbPerSec: isAllCompleted ? 0.0 : totalSpeed,
+      speedMbPerSec: isAllCompleted ? 0.0 : effectiveSpeed,
       bytesTransferred: isAllCompleted ? totalBytes : maxBytes,
       totalBytes: totalBytes,
       remainingSeconds: isAllCompleted ? 0 : remainingSec,
@@ -470,8 +500,8 @@ class TransferSessionManager {
     _emitSnapshot();
 
     final pctInt = _currentSnapshot!.progressPercent.clamp(0.0, 100.0).round();
-    final speedStr = totalSpeed > 0
-        ? '${totalSpeed.toStringAsFixed(1)} MB/s'
+    final speedStr = effectiveSpeed > 0
+        ? '${effectiveSpeed.toStringAsFixed(1)} MB/s'
         : 'Connecting...';
     final remainingStr = _currentSnapshot!.formattedRemainingTime;
 
@@ -576,6 +606,8 @@ class TransferSessionManager {
     _serverReceiversSub = null;
     _hostReceiverBytes.clear();
     _hostReceiverSpeed.clear();
+    _lastHostSnapshotTime = null;
+    _lastHostBytesTransferred = 0;
     if (_activeServer != null) {
       _activeServer!.removeControlListener(_handleHostControlMessage);
     }

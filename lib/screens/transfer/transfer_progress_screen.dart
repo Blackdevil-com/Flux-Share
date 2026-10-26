@@ -155,7 +155,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
       _bindBatchCoordinator(widget.batchCoordinator!);
     } else if (widget.engine != null) {
       _bindTransferEngine(widget.engine!);
-    } else if (widget.isHost) {
+    }
+
+    if (widget.isHost) {
       _bindHostControl();
     }
   }
@@ -251,8 +253,10 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
 
   void _bindHostControl() {
     final server = LocalServer();
-    _liveReceivers = server.connectedReceivers;
-    _liveReceiversSub = server.connectedReceiversStream.listen((list) {
+    if (_liveReceivers.isEmpty && server.connectedReceivers.isNotEmpty) {
+      _liveReceivers = server.connectedReceivers;
+    }
+    _liveReceiversSub ??= server.connectedReceiversStream.listen((list) {
       if (!mounted) return;
       setState(() {
         _liveReceivers = list;
@@ -492,6 +496,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   String _formatRemainingTime() {
     if (_isPaused) return 'Paused';
     if (_progressPercent >= 100) return '00:00';
+    if (_speedMbPerSec <= 0.05 && _remainingSeconds <= 0) return '--:--';
     final mins = (_remainingSeconds ~/ 60).toString().padLeft(2, '0');
     final secs = (_remainingSeconds % 60).toString().padLeft(2, '0');
     return '$mins:$secs';
@@ -624,7 +629,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         ? '0 MB/s'
         : _speedMbPerSec > 0
             ? '${_speedMbPerSec.toStringAsFixed(1)} MB/s'
-            : (_progressPercent >= 100 ? 'Done' : 'Connecting...');
+            : (_progressPercent >= 100 ? 'Done' : (widget.isHost ? 'Distributing...' : 'Connecting...'));
 
     return Scaffold(
       backgroundColor: AppColors.backgroundWhite,

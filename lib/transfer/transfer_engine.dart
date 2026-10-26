@@ -1,5 +1,6 @@
 import '../models/transfer_failure_reason.dart';
 import '../services/storage_diagnostics_service.dart';
+import '../services/storage_path_service.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
@@ -204,6 +205,7 @@ class TransferEngine {
         final worker = TransferWorker(
           workerId: 'worker_$i',
           fileId: manifest.fileId,
+          localPeerId: localPeerId,
           reservationManager: _reservationManager,
           writerSession: _writerSession,
           downloader: _sharedDownloader,
@@ -485,6 +487,10 @@ class TransferEngine {
     await _metricsCollector.finalizeTransfer();
 
     try {
+      await StoragePathService.scanFile(destinationFile.path);
+    } catch (_) {}
+
+    try {
       webSocketService?.notifyTransferCompleted(fileId: manifest.fileId);
     } catch (_) {}
 
@@ -607,6 +613,7 @@ class TransferEngine {
           final worker = TransferWorker(
             workerId: 'worker_$i',
             fileId: manifest.fileId,
+            localPeerId: localPeerId,
             reservationManager: _reservationManager,
             writerSession: _writerSession,
             downloader: _sharedDownloader,

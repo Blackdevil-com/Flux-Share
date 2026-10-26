@@ -62,6 +62,7 @@ class ChunkDownloader {
     required ChunkMeta chunkMeta,
     required ChunkWriterSession writerSession,
     String? fileId,
+    String? localPeerId,
     bool allowLegacyFallback = false,
     Duration connectTimeout = const Duration(seconds: 5),
     Duration headerTimeout = const Duration(seconds: 8),
@@ -88,6 +89,9 @@ class ChunkDownloader {
         connectTimeout,
         onTimeout: () => throw TimeoutException('Connection timed out connecting to ${peer.ip}'),
       );
+      if (localPeerId != null && localPeerId.isNotEmpty) {
+        request.headers.set('X-Peer-Id', localPeerId);
+      }
 
       final responseFuture = request.close();
       response = await responseFuture.timeout(
@@ -102,6 +106,9 @@ class ChunkDownloader {
           connectTimeout,
           onTimeout: () => throw TimeoutException('Fallback connection timed out to ${peer.ip}'),
         );
+        if (localPeerId != null && localPeerId.isNotEmpty) {
+          fallbackReq.headers.set('X-Peer-Id', localPeerId);
+        }
         response = await fallbackReq.close().timeout(
           headerTimeout,
           onTimeout: () => throw TimeoutException('Peer ${peer.ip} failed on fallback headers'),

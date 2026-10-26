@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:path_provider/path_provider.dart';
 import '../../app/theme.dart';
 import '../../discovery/discovery_service.dart';
 import '../../file/filename_sanitizer.dart';
@@ -12,6 +11,7 @@ import '../../network/network_utils.dart';
 import '../../network/local_server.dart';
 import '../../network/websocket_service.dart';
 import '../../services/storage_diagnostics_service.dart';
+import '../../services/storage_path_service.dart';
 import '../../transfer/batch_transfer_coordinator.dart';
 import '../../transfer/transfer_session_manager.dart';
 import '../../widgets/widgets.dart';
@@ -71,7 +71,9 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
   @override
   void dispose() {
     _wsSubscription?.cancel();
-    _activeWsService?.disconnect();
+    if (!_transferInitiated) {
+      _activeWsService?.disconnect();
+    }
     _pulseController.dispose();
     _pinController.dispose();
     super.dispose();
@@ -202,8 +204,8 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
           ip: localIp,
         );
 
-        final docsDir = await getApplicationDocumentsDirectory();
-        final availableSpace = await StorageDiagnosticsService().getAvailableStorageBytes(docsDir.path);
+        final targetDir = await StoragePathService.getReceivedFilesDirectory();
+        final availableSpace = await StorageDiagnosticsService().getAvailableStorageBytes(targetDir.path);
         final requiredBytes = batch.totalBytes + (20 * 1024 * 1024);
 
         if (availableSpace != null && availableSpace < requiredBytes) {
@@ -386,8 +388,8 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
           ip: localIp,
         );
 
-        final docsDir = await getApplicationDocumentsDirectory();
-        final availableSpace = await StorageDiagnosticsService().getAvailableStorageBytes(docsDir.path);
+        final targetDir = await StoragePathService.getReceivedFilesDirectory();
+        final availableSpace = await StorageDiagnosticsService().getAvailableStorageBytes(targetDir.path);
         final requiredBytes = batch.totalBytes + (20 * 1024 * 1024);
 
         if (availableSpace != null && availableSpace < requiredBytes) {
@@ -588,11 +590,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
     if (batch == null || batch.manifests.isEmpty) return;
 
     try {
-      final docsDir = await getApplicationDocumentsDirectory();
-      final destDir = Directory('${docsDir.path}/FluxShare');
-      if (!await destDir.exists()) {
-        await destDir.create(recursive: true);
-      }
+      final destDir = await StoragePathService.getReceivedFilesDirectory();
 
       final localServer = LocalServer();
       await localServer.start();
@@ -638,13 +636,11 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
         final ext = m.fileName.contains('.')
             ? m.fileName.split('.').last.toLowerCase()
             : '';
-        final info = FileInfo(
-          id: m.fileId,
+        final info = FileInfo.fromMetadata(
+          path: destFile.path,
           name: m.fileName,
           sizeBytes: m.fileSize,
-          formattedSize: _formatBytes(m.fileSize),
           extension: ext,
-          type: FileType.fromString(ext),
         );
 
         batchItems.add(
