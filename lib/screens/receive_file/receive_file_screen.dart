@@ -607,6 +607,11 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
         _activeWsService = wsService;
       }
 
+      final Map<String, Set<int>> hostChunksByFile = {};
+      for (final m in batch.manifests) {
+        hostChunksByFile[m.fileId] = Set.from(List.generate(m.chunkCount, (i) => i));
+      }
+
       final hostPeer = PeerInfo(
         peerId: 'host_${_discoveredRoom!.ip}',
         deviceName: _senderName,
@@ -617,6 +622,7 @@ class _ReceiveFileScreenState extends State<ReceiveFileScreen>
         availableChunks: Set.from(
           List.generate(batch.manifests.first.chunkCount, (i) => i),
         ),
+        availableChunksByFile: hostChunksByFile,
       );
 
       final List<BatchTransferItem> batchItems = [];

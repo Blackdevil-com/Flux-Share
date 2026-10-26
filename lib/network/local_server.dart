@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'package:flutter/foundation.dart';
 import 'package:shelf/shelf.dart';
 import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
@@ -281,18 +282,21 @@ class LocalServer {
     // 2c. GET /file/<fileId>/manifest
     router.get('/file/<fileId>/manifest', (Request request, String fileId) {
       if (_activeBatchId == null) {
+        debugPrint('[FluxShare-Server] [404] Manifest rejected: No active batch');
         return Response.notFound(
           jsonEncode({'error': 'MANIFEST_NOT_READY', 'message': 'No active batch'}),
           headers: {'content-type': 'application/json'},
         );
       }
-      final m = _manifests[fileId];
+      final decodedFileId = Uri.decodeComponent(fileId);
+      final m = _manifests[fileId] ?? _manifests[decodedFileId];
       if (m != null) {
         return Response.ok(
           jsonEncode(m.toJson()),
           headers: {'content-type': 'application/json'},
         );
       }
+      debugPrint('[FluxShare-Server] [404] Manifest not found for fileId: $fileId (decoded: $decodedFileId). Available fileIds: ${_manifests.keys.toList()}');
       return Response.notFound(
         jsonEncode({'error': 'FILE_NOT_FOUND', 'message': 'Manifest for file $fileId not found'}),
         headers: {'content-type': 'application/json'},
@@ -302,21 +306,29 @@ class LocalServer {
     // 3a. GET /file/<fileId>/chunk/<chunkId> (Multi-file isolated streaming)
     router.get('/file/<fileId>/chunk/<chunkId>', (Request request, String fileId, String chunkIdStr) async {
       if (_activeBatchId == null) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: No active batch');
         return Response.notFound('No active batch');
       }
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Invalid chunk ID "$chunkIdStr"');
         return Response.notFound('Invalid chunk ID');
       }
 
-      final m = _manifests[fileId];
-      final file = _sourceFiles[fileId];
+      final decodedFileId = Uri.decodeComponent(fileId);
+      final m = _manifests[fileId] ?? _manifests[decodedFileId];
+      final file = _sourceFiles[fileId] ?? _sourceFiles[decodedFileId];
+      final activeFileId = _manifests.containsKey(fileId) ? fileId : decodedFileId;
+
       if (m == null || file == null || !await file.exists()) {
+        final exists = file != null && await file.exists();
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Source file or manifest not available for file $fileId (decoded: $decodedFileId, manifestFound: ${m != null}, fileExists: $exists). Available: ${_manifests.keys.toList()}');
         return Response.notFound('Source file or manifest not available for file $fileId');
       }
 
-      final fileChunks = _verifiedChunksByFile[fileId] ?? verifiedChunks;
+      final fileChunks = _verifiedChunksByFile[activeFileId] ?? _verifiedChunksByFile[fileId] ?? verifiedChunks;
       if (!fileChunks.contains(chunkId)) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Chunk $chunkId for file $fileId not available on this peer. Verified count: ${fileChunks.length}');
         return Response.notFound('Chunk $chunkId for file $fileId not available on this peer');
       }
 
@@ -332,10 +344,11 @@ class LocalServer {
           headers: {
             'content-type': 'application/octet-stream',
             'content-length': '${chunk.length}',
-            'content-disposition': 'attachment; filename="chunk_${fileId}_$chunkId"',
+            'content-disposition': 'attachment; filename="chunk_${activeFileId}_$chunkId"',
           },
         );
       } catch (e) {
+        debugPrint('[FluxShare-Server] [500] Error reading chunk $chunkId for file $fileId: $e');
         return Response.internalServerError(body: 'Error reading chunk: $e');
       }
     });
@@ -343,20 +356,24 @@ class LocalServer {
     // 3b. GET /chunk/<chunkId> (Single-file legacy streaming)
     router.get('/chunk/<chunkId>', (Request request, String chunkIdStr) async {
       if (_activeBatchId == null) {
+        debugPrint('[FluxShare-Server] [404] Legacy chunk rejected: No active batch');
         return Response.notFound('No active batch');
       }
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
+        debugPrint('[FluxShare-Server] [404] Legacy chunk rejected: Invalid chunk ID "$chunkIdStr"');
         return Response.notFound('Invalid chunk ID');
       }
 
       final m = currentManifest;
       final file = currentSourceFile;
       if (m == null || file == null || !await file.exists()) {
+        debugPrint('[FluxShare-Server] [404] Legacy chunk rejected: Source file or manifest not available');
         return Response.notFound('Source file or manifest not available');
       }
 
       if (!verifiedChunks.contains(chunkId)) {
+        debugPrint('[FluxShare-Server] [404] Legacy chunk rejected: Chunk $chunkId not available on this peer');
         return Response.notFound('Chunk $chunkId not available on this peer');
       }
 
@@ -368,7 +385,6 @@ class LocalServer {
       try {
         // Zero-buffer direct disk streaming to socket
         final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
-
         return Response.ok(
           stream,
           headers: {
@@ -378,6 +394,7 @@ class LocalServer {
           },
         );
       } catch (e) {
+        debugPrint('[FluxShare-Server] [500] Error reading legacy chunk $chunkId: $e');
         return Response.internalServerError(body: 'Error reading chunk: $e');
       }
     });
@@ -504,7 +521,9 @@ class LocalServer {
               final pct = (parsed['percent'] as num?)?.toDouble() ?? 0.0;
               final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
               final existing = _connectedReceivers[activePeerId];
-              if (existing != null) {
+              if (existing != null &&
+                  existing.status != ReceiverStatus.failed &&
+                  existing.status != ReceiverStatus.disconnected) {
                 _connectedReceivers[activePeerId] = existing.copyWith(
                   status: ReceiverStatus.receiving,
                   progressPercent: pct,
@@ -577,6 +596,15 @@ class LocalServer {
     router.get('/ws', wsHandler);
 
     final handler = const Pipeline()
+        .addMiddleware((innerHandler) {
+          return (Request req) async {
+            final res = await innerHandler(req);
+            if (res.statusCode == 404) {
+              debugPrint('[FluxShare-Server] [404] method=${req.method}, path=/${req.url.path}');
+            }
+            return res;
+          };
+        })
         .addMiddleware(logRequests())
         .addHandler(router.call);
 

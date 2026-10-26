@@ -322,7 +322,7 @@ class DiscoveryService {
   Future<DiscoverRoomResult> discoverRoomResult({
     required String pin,
     int discoveryPort = defaultDiscoveryPort,
-    Duration timeout = const Duration(milliseconds: 3800),
+    Duration timeout = const Duration(milliseconds: 4500),
   }) async {
     RawDatagramSocket? clientSocket;
     Timer? timer;

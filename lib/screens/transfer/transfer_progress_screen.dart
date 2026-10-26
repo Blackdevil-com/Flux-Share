@@ -292,7 +292,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         _progressPercent = 100.0;
       });
       _onTransferSuccess();
-    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY') {
+    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY' || type == 'RECEIVER_FAILED') {
       setState(() {
         _liveReceivers = LocalServer().connectedReceivers;
       });
@@ -987,7 +987,7 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
                           ),
                           _buildStatColumn(
                             label: 'Receivers',
-                            value: '${widget.isHost ? (_liveReceivers.isNotEmpty ? _liveReceivers.length : _receiverDevices.length) : 1}',
+                            value: '${widget.isHost ? (_liveReceivers.isNotEmpty ? _liveReceivers.where((r) => r.status != ReceiverStatus.disconnected && r.status != ReceiverStatus.failed).length : _receiverDevices.length) : 1}',
                             icon: Icons.devices_rounded,
                           ),
                         ],

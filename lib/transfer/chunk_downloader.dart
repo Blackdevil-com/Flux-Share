@@ -68,8 +68,9 @@ class ChunkDownloader {
     Duration bodyStreamIdleTimeout = const Duration(seconds: 15),
   }) async {
     final stopwatch = Stopwatch()..start();
-    final primaryUrl = fileId != null
-        ? 'http://${peer.ip}:${peer.httpPort}/file/$fileId/chunk/${chunkMeta.chunkId}'
+    final encodedFileId = fileId != null ? Uri.encodeComponent(fileId) : null;
+    final primaryUrl = encodedFileId != null
+        ? 'http://${peer.ip}:${peer.httpPort}/file/$encodedFileId/chunk/${chunkMeta.chunkId}'
         : 'http://${peer.ip}:${peer.httpPort}/chunk/${chunkMeta.chunkId}';
 
     Duration? timeToFirstByte;

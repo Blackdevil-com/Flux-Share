@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:uuid/uuid.dart';
 import '../../app/theme.dart';
 import '../../discovery/discovery_service.dart';
 import '../../file/file_picker_service.dart';
@@ -132,6 +133,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
   late String _roomPin;
   String _hostAddress = '';
   bool _isHostingStarted = false;
+  BatchManifest? _hostedBatchManifest;
   bool _navigatedToTransfer = false;
   List<ConnectedReceiver> _connectedReceivers = [];
   StreamSubscription<List<ConnectedReceiver>>? _receiversSub;
@@ -146,9 +148,10 @@ class _SendFileScreenState extends State<SendFileScreen> {
       _startPreparationQueue();
     } else if (widget.initialFile != null) {
       final file = File(widget.initialFile!.id);
+      final id = widget.initialManifest?.fileId ?? const Uuid().v4();
       _selectedFiles.add(
         PickedFileItem(
-          id: widget.initialFile!.id,
+          id: id,
           jobId: 1,
           file: file,
           info: widget.initialFile!,
@@ -301,7 +304,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
         }
 
         final item = PickedFileItem(
-          id: '${payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+          id: const Uuid().v4(),
           jobId: 1,
           file: payload.file,
           info: payload.toFileInfo(),
@@ -311,6 +314,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
           sessionId: payload.sessionId ?? _sessionId,
         );
         _selectedFiles.add(item);
+        _hostedBatchManifest = null;
         addedCount++;
         debugPrint('[FluxShare-Diag] [B1:Select] jobId=${item.jobId}, file=${item.info.name}, size=${item.info.sizeBytes}');
       }
@@ -664,7 +668,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
       }
 
       final newItem = PickedFileItem(
-        id: '${item.payload.file.path}_${DateTime.now().microsecondsSinceEpoch}',
+        id: const Uuid().v4(),
         jobId: 1,
         file: item.payload.file,
         info: item.payload.toFileInfo(),
@@ -674,6 +678,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
         sessionId: item.payload.sessionId ?? _sessionId,
       );
       _selectedFiles.add(newItem);
+      _hostedBatchManifest = null;
       newlyAddedCount++;
       debugPrint('[FluxShare-Diag] [B1:Select] jobId=${newItem.jobId}, file=${newItem.info.name}, size=${newItem.info.sizeBytes}');
     }
@@ -754,6 +759,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
       }
       setState(() {
         _selectedFiles.removeAt(index);
+        _hostedBatchManifest = null;
       });
       _manifestUpdateNotifier.value++;
       debugPrint('[FluxShare] Selection state contains: ${_selectedFiles.length} files');
@@ -1013,10 +1019,11 @@ class _SendFileScreenState extends State<SendFileScreen> {
       final List<({Manifest manifest, File file})> batchItems =
           _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
 
-      final batchManifest = BatchManifest(
+      final batchManifest = _hostedBatchManifest ?? BatchManifest(
         batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
         manifests: manifests,
       );
+      _hostedBatchManifest = batchManifest;
 
       final server = LocalServer();
       final port = await server.start();
@@ -1074,10 +1081,11 @@ class _SendFileScreenState extends State<SendFileScreen> {
       final List<({Manifest manifest, File file})> batchItems =
           _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
 
-      final batchManifest = BatchManifest(
+      final batchManifest = _hostedBatchManifest ?? BatchManifest(
         batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
         manifests: manifests,
       );
+      _hostedBatchManifest = batchManifest;
 
       final server = LocalServer();
       final port = await server.start();

@@ -159,16 +159,22 @@ class NetworkUtils {
   /// may be filtered or isolated by hostapd/iptables between clients.
   static Future<Set<InternetAddress>> getDiscoveryTargets({String? localIpOverride}) async {
     final targets = <InternetAddress>{};
+    final allIps = localIpOverride != null
+        ? [localIpOverride]
+        : await getAllLocalIpAddresses();
     final localIp = localIpOverride ?? await getLocalIpAddress();
+    final effectiveIps = allIps.isNotEmpty ? allIps : (localIp != null ? [localIp] : <String>[]);
 
-    if (localIp != null && localIp.contains('.')) {
-      final parts = localIp.split('.');
-      if (parts.length == 4) {
-        final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
-        // Subnet broadcast
-        targets.add(InternetAddress('$prefix.255'));
-        // Subnet gateway / hotspot host unicast
-        targets.add(InternetAddress('$prefix.1'));
+    for (final ip in effectiveIps) {
+      if (ip.contains('.')) {
+        final parts = ip.split('.');
+        if (parts.length == 4) {
+          final prefix = '${parts[0]}.${parts[1]}.${parts[2]}';
+          // Subnet broadcast
+          targets.add(InternetAddress('$prefix.255'));
+          // Subnet gateway / hotspot host unicast
+          targets.add(InternetAddress('$prefix.1'));
+        }
       }
     }
 

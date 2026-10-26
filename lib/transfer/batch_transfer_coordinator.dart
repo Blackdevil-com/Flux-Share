@@ -234,6 +234,12 @@ class BatchTransferCoordinator {
         item.errorMessage = engine.lastErrorMessage ??
             engine.lastFailureReason?.toUserMessage() ??
             (item.errorMessage ?? 'Transfer failed');
+        if (!_isCancelled) {
+          webSocketService?.sendReceiverFailed(
+            peerId: localPeerId,
+            error: item.errorMessage ?? 'Transfer failed',
+          );
+        }
       }
 
       _recordHistory(item);
@@ -271,6 +277,9 @@ class BatchTransferCoordinator {
     item.bytesTransferred = 0;
     item.progressPercent = 0.0;
     _emitProgress();
+    webSocketService?.sendReceiverReady(
+      peerId: localPeerId,
+    );
 
     final targetFile = item.destinationFile ?? item.sourceFile;
     if (targetFile == null) return false;
@@ -317,6 +326,12 @@ class BatchTransferCoordinator {
       item.errorMessage = engine.lastErrorMessage ??
           engine.lastFailureReason?.toUserMessage() ??
           'Retry failed';
+      if (!_isCancelled) {
+        webSocketService?.sendReceiverFailed(
+          peerId: localPeerId,
+          error: item.errorMessage ?? 'Retry failed',
+        );
+      }
     }
 
     _recordHistory(item);
@@ -366,6 +381,10 @@ class BatchTransferCoordinator {
       _batchCompleter!.complete(false);
     }
     _emitProgress();
+    webSocketService?.sendReceiverFailed(
+      peerId: localPeerId,
+      error: 'Transfer cancelled by receiver',
+    );
   }
 
   Future<void> dispose() async {
@@ -464,7 +483,7 @@ class BatchTransferCoordinator {
     );
 
     // Synchronize progress to host coordinator in real-time
-    if (webSocketService != null && !isHost && webSocketService!.isConnected) {
+    if (webSocketService != null && !isHost && webSocketService!.isConnected && !_isCancelled) {
       webSocketService!.send({
         'type': 'TRANSFER_PROGRESS',
         'sessionId': batchId,

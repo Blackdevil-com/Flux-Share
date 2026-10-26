@@ -111,6 +111,7 @@ class TransferWorker {
           chunkMeta: chunk,
           writerSession: writerSession,
           fileId: fileId,
+          allowLegacyFallback: true,
         );
       } catch (e) {
         result = ChunkDownloadResult(

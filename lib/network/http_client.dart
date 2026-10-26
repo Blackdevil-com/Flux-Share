@@ -125,10 +125,13 @@ class P2PHttpClient {
   Future<ManifestFetchResult> downloadManifest(
     String peerIp,
     int peerPort, {
+    String? fileId,
     int maxRetries = 3,
     Duration retryDelay = const Duration(milliseconds: 600),
   }) async {
-    final url = 'http://$peerIp:$peerPort/manifest';
+    final encodedFileId = fileId != null ? Uri.encodeComponent(fileId) : null;
+    final path = encodedFileId != null ? '/file/$encodedFileId/manifest' : '/manifest';
+    final url = 'http://$peerIp:$peerPort$path';
     ManifestFetchResult? lastResult;
 
     for (int attempt = 1; attempt <= maxRetries; attempt++) {
