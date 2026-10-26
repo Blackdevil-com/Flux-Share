@@ -7,6 +7,7 @@ import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import '../models/chunk.dart';
 import '../models/connected_receiver.dart';
 import '../models/device.dart';
 import '../models/manifest.dart';
@@ -90,13 +91,15 @@ class LocalServer {
     _connectedReceiversController.add(connectedReceivers);
   }
 
-  void clearReceivers() {
+  void clearReceivers({bool notify = true}) {
     _connectedReceivers.clear();
     _channelPeerMap.clear();
     _servedChunksByPeer.clear();
     _bytesServedByPeer.clear();
     _transferStarted = false;
-    _connectedReceiversController.add([]);
+    if (notify) {
+      _connectedReceiversController.add([]);
+    }
   }
 
   /// Replaces the active batch atomically. Validates items, clears previous batch data,
@@ -141,8 +144,8 @@ class LocalServer {
   }
 
   /// Completely clears active batch metadata, manifests, source files, and chunk indexes.
-  void clearBatch() {
-    clearReceivers();
+  void clearBatch({bool notify = true}) {
+    clearReceivers(notify: notify);
     _activeBatchId = null;
     _primaryFileId = null;
     _manifests.clear();
@@ -231,7 +234,7 @@ class LocalServer {
         _connectedReceiversController.add(connectedReceivers);
 
         _notifyControlListeners({
-          'type': isComplete ? 'TRANSFER_COMPLETED' : 'TRANSFER_PROGRESS',
+          'type': 'TRANSFER_PROGRESS',
           'sessionId': _activeBatchId ?? '',
           'peerId': targetPeerId,
           'percent': effectivePct,
@@ -428,10 +431,13 @@ class LocalServer {
         return Response.notFound('Chunk $chunkId for file $fileId not available on this peer');
       }
 
-      final chunk = m.chunks.firstWhere(
-        (c) => c.chunkId == chunkId,
-        orElse: () => throw Exception('Not found'),
-      );
+      final ChunkMeta chunk;
+      try {
+        chunk = m.chunks.firstWhere((c) => c.chunkId == chunkId);
+      } catch (_) {
+        debugPrint('[FluxShare-Server] [404] Chunk $chunkId not found in manifest for file $fileId');
+        return Response.notFound('Chunk $chunkId not found in manifest');
+      }
 
       try {
         final stream = file.openRead(chunk.offset, chunk.offset + chunk.length);
@@ -479,10 +485,13 @@ class LocalServer {
         return Response.notFound('Chunk $chunkId not available on this peer');
       }
 
-      final chunk = m.chunks.firstWhere(
-        (c) => c.chunkId == chunkId,
-        orElse: () => throw Exception('Not found'),
-      );
+      final ChunkMeta chunk;
+      try {
+        chunk = m.chunks.firstWhere((c) => c.chunkId == chunkId);
+      } catch (_) {
+        debugPrint('[FluxShare-Server] [404] Legacy chunk $chunkId not found in manifest');
+        return Response.notFound('Chunk $chunkId not found');
+      }
 
       try {
         // Zero-buffer direct disk streaming to socket

@@ -101,6 +101,7 @@ class TransferSessionManager {
   String? _roomPin;
   String? _activeSessionId;
   bool _isHost = false;
+  bool _hostCompletedEmitted = false;
   DateTime? _lastHostSnapshotTime;
   int _lastHostBytesTransferred = 0;
 
@@ -140,6 +141,7 @@ class TransferSessionManager {
     _cleanExistingSession();
 
     _isHost = true;
+    _hostCompletedEmitted = false;
     _activeSessionId = sessionId ?? batchManifest.batchId;
     _activeServer = server;
     _activeBatchManifest = batchManifest;
@@ -471,8 +473,9 @@ class TransferSessionManager {
     final isAllCompleted = _hostReceiverProgress.isNotEmpty &&
         _hostReceiverProgress.values.every((p) => p >= 100.0);
 
-    final wasAlreadyCompleted = _currentSnapshot?.status == TransferStatus.completed;
-    if (isAllCompleted && !wasAlreadyCompleted) {
+    if (isAllCompleted) {
+      if (_hostCompletedEmitted) return;
+      _hostCompletedEmitted = true;
       final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
       if (sId != null) {
         unawaited(ManagedTemporaryFileService.instance.cleanupSession(
@@ -608,6 +611,7 @@ class TransferSessionManager {
     _hostReceiverSpeed.clear();
     _lastHostSnapshotTime = null;
     _lastHostBytesTransferred = 0;
+    _hostCompletedEmitted = false;
     if (_activeServer != null) {
       _activeServer!.removeControlListener(_handleHostControlMessage);
     }

@@ -76,6 +76,8 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   final Map<String, double> _receiverProgressMap = {};
   List<ConnectedReceiver> _liveReceivers = [];
   StreamSubscription<List<ConnectedReceiver>>? _liveReceiversSub;
+  bool _completionHandled = false;
+  bool _hasNavigatedToComplete = false;
 
   @override
   void initState() {
@@ -293,9 +295,20 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     } else if (type == 'TRANSFER_COMPLETED') {
       setState(() {
         _receiverProgressMap[peerId] = 100.0;
-        _progressPercent = 100.0;
+        if (_receiverProgressMap.isNotEmpty) {
+          final avg = _receiverProgressMap.values.reduce((a, b) => a + b) /
+              _receiverProgressMap.length;
+          _progressPercent = avg;
+        } else {
+          _progressPercent = 100.0;
+        }
       });
-      _onTransferSuccess();
+      // CRITICAL 1-TO-MANY FIX: For host, an individual receiver completing does NOT complete
+      // the transfer for everyone. The host completes only when TransferSessionManager determines
+      // that all receivers have finished (via progressStream).
+      if (!widget.isHost) {
+        _onTransferSuccess();
+      }
     } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY' || type == 'RECEIVER_FAILED') {
       setState(() {
         _liveReceivers = LocalServer().connectedReceivers;
@@ -304,6 +317,9 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   }
 
   void _onTransferSuccess() {
+    if (_completionHandled) return;
+    _completionHandled = true;
+
     final totalFiles = _batchEvent?.totalFiles ??
         (widget.batchManifest?.totalFiles ?? 1);
 
@@ -338,9 +354,14 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     TransferRepository().updateTransfer(transfer);
 
     if (widget.isHost) {
+      LocalServer().removeControlListener(_handleHostControlMessage);
+      _liveReceiversSub?.cancel();
+      _liveReceiversSub = null;
+      _sessionSub?.cancel();
+      _sessionSub = null;
       DiscoveryService().stopRoomHost();
       RoomManager().expireRoom();
-      LocalServer().clearBatch();
+      LocalServer().clearBatch(notify: false);
     }
 
     if (mounted) {
@@ -463,7 +484,8 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
   }
 
   void _navigateToComplete() {
-    if (!mounted) return;
+    if (!mounted || _hasNavigatedToComplete) return;
+    _hasNavigatedToComplete = true;
     Navigator.of(context).pushReplacement(
       MaterialPageRoute(
         builder: (context) => TransferCompleteScreen(
