@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 import 'package:flutter/foundation.dart';
 import '../models/connected_receiver.dart';
 import '../models/batch_manifest.dart';
@@ -102,6 +103,8 @@ class TransferSessionManager {
   String? _activeSessionId;
   bool _isHost = false;
   bool _hostCompletedEmitted = false;
+  double _displayedProgressPercent = 0.0;
+  double _lastEffectiveSpeed = 0.0;
   DateTime? _lastHostSnapshotTime;
   int _lastHostBytesTransferred = 0;
 
@@ -163,19 +166,35 @@ class TransferSessionManager {
     _hostReceiverSpeed.clear();
     _lastHostSnapshotTime = null;
     _lastHostBytesTransferred = 0;
+    _lastEffectiveSpeed = 0.0;
+    _displayedProgressPercent = 0.0;
     for (final r in receivers) {
       _hostReceiverProgress[r.id] = 0.0;
+      _hostReceiverBytes[r.id] = 0;
     }
+    final batchTotalBytes = batchManifest.totalBytes;
     for (final cr in server.connectedReceivers) {
-      _hostReceiverProgress[cr.peerId] = cr.progressPercent;
-      _hostReceiverBytes[cr.peerId] = cr.bytesReceived;
+      final clampedPct = cr.progressPercent.clamp(0.0, 100.0);
+      final clampedBytes = batchTotalBytes > 0
+          ? cr.bytesReceived.clamp(0, batchTotalBytes)
+          : max(0, cr.bytesReceived);
+      _hostReceiverProgress[cr.peerId] = clampedPct;
+      _hostReceiverBytes[cr.peerId] = clampedBytes;
     }
 
     _activeServer!.addControlListener(_handleHostControlMessage);
     _serverReceiversSub = _activeServer!.connectedReceiversStream.listen((list) {
+      final totalB = _activeBatchManifest?.totalBytes ?? 0;
       for (final cr in list) {
-        _hostReceiverProgress[cr.peerId] = cr.progressPercent;
-        _hostReceiverBytes[cr.peerId] = cr.bytesReceived;
+        final currentP = _hostReceiverProgress[cr.peerId] ?? 0.0;
+        final currentB = _hostReceiverBytes[cr.peerId] ?? 0;
+        final clampedP = cr.progressPercent.clamp(0.0, 100.0);
+        final clampedB = totalB > 0
+            ? cr.bytesReceived.clamp(0, totalB)
+            : max(0, cr.bytesReceived);
+
+        _hostReceiverProgress[cr.peerId] = max(currentP, clampedP);
+        _hostReceiverBytes[cr.peerId] = max(currentB, clampedB);
       }
       _updateHostSnapshot();
     });
@@ -398,17 +417,49 @@ class TransferSessionManager {
 
   void _handleHostControlMessage(Map<String, dynamic> msg) {
     final type = msg['type'] as String?;
-    final peerId = msg['peerId'] as String? ?? 'receiver';
+    String peerId = msg['peerId'] as String? ?? '';
+    if (peerId.isEmpty) {
+      if (_hostReceiverProgress.length == 1) {
+        peerId = _hostReceiverProgress.keys.first;
+      } else if (_activeServer?.connectedReceivers.length == 1) {
+        peerId = _activeServer!.connectedReceivers.first.peerId;
+      } else {
+        peerId = 'receiver';
+      }
+    }
 
     if (type == 'TRANSFER_PROGRESS') {
-      final percent = (msg['percent'] as num?)?.toDouble() ?? 0.0;
-      final bytes = (msg['bytesTransferred'] as num?)?.toInt() ?? 0;
-      final speed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
+      final rawPercent = (msg['percent'] as num?)?.toDouble();
+      final rawBytes = (msg['bytesTransferred'] as num?)?.toInt();
+      final rawSpeed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
           (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
 
-      _hostReceiverProgress[peerId] = percent;
-      _hostReceiverBytes[peerId] = bytes;
-      _hostReceiverSpeed[peerId] = speed;
+      // Discard invalid / NaN inputs
+      if (rawPercent != null && (rawPercent.isNaN || rawPercent.isInfinite)) return;
+      if (rawSpeed.isNaN || rawSpeed.isInfinite) return;
+
+      final totalBytes = _activeBatchManifest?.totalBytes ?? 0;
+      final clampedPercent = (rawPercent ?? 0.0).clamp(0.0, 100.0);
+      final clampedBytes = totalBytes > 0
+          ? (rawBytes ?? 0).clamp(0, totalBytes)
+          : max(0, rawBytes ?? 0);
+
+      final currentProgress = _hostReceiverProgress[peerId] ?? 0.0;
+      final currentBytes = _hostReceiverBytes[peerId] ?? 0;
+
+      // Drop stale out-of-order progress updates that would regress this receiver's progress
+      if (clampedPercent < currentProgress && clampedBytes <= currentBytes) {
+        return;
+      }
+
+      final effectiveProgress = max(currentProgress, clampedPercent);
+      final effectiveBytes = max(currentBytes, clampedBytes);
+
+      _hostReceiverProgress[peerId] = effectiveProgress;
+      _hostReceiverBytes[peerId] = effectiveBytes;
+      if (rawSpeed >= 0.0) {
+        _hostReceiverSpeed[peerId] = rawSpeed;
+      }
 
       _updateHostSnapshot();
     } else if (type == 'TRANSFER_COMPLETED') {
@@ -417,7 +468,13 @@ class TransferSessionManager {
         _hostReceiverBytes[peerId] = _activeBatchManifest!.totalBytes;
       }
       _updateHostSnapshot();
-    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY' || type == 'RECEIVER_FAILED') {
+    } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY') {
+      if (!_hostReceiverProgress.containsKey(peerId)) {
+        _hostReceiverProgress[peerId] = 0.0;
+        _hostReceiverBytes[peerId] = 0;
+      }
+      _updateHostSnapshot();
+    } else if (type == 'RECEIVER_FAILED') {
       _updateHostSnapshot();
     }
   }
@@ -426,78 +483,138 @@ class TransferSessionManager {
     if (_activeBatchManifest == null) return;
 
     final connected = _activeServer?.connectedReceivers ?? [];
-    if (connected.isNotEmpty) {
-      final connectedPeerIds = connected.map((c) => c.peerId).toSet();
-      _hostReceiverProgress.removeWhere(
-        (k, v) => !connectedPeerIds.contains(k) && (!_hostReceiverBytes.containsKey(k) || _hostReceiverBytes[k] == 0),
-      );
+    final connectedPeerIds = connected.map((c) => c.peerId).toSet();
+    final expectedPeerIds = _activeReceivers.map((r) => r.id).toSet();
+    final allKnownPeerIds = connectedPeerIds.union(expectedPeerIds);
+
+    // Clean up temporary receivers that disconnected with 0 bytes and were not pre-selected
+    _hostReceiverProgress.removeWhere(
+      (k, v) =>
+          !connectedPeerIds.contains(k) &&
+          !expectedPeerIds.contains(k) &&
+          (!_hostReceiverBytes.containsKey(k) || _hostReceiverBytes[k] == 0),
+    );
+
+    // Ensure all connected or expected receivers are tracked
+    for (final id in allKnownPeerIds) {
+      _hostReceiverProgress.putIfAbsent(id, () => 0.0);
+      _hostReceiverBytes.putIfAbsent(id, () => 0);
     }
 
     final totalBytes = _activeBatchManifest!.totalBytes;
     final totalFiles = _activeBatchManifest!.totalFiles;
 
-    final avgProgress = _hostReceiverProgress.isNotEmpty
-        ? _hostReceiverProgress.values.reduce((a, b) => a + b) / _hostReceiverProgress.length
+    // Calculate truthful raw aggregate progress across all tracked receivers
+    final rawAggregateProgress = _hostReceiverProgress.isNotEmpty
+        ? (_hostReceiverProgress.values.reduce((a, b) => a + b) /
+                _hostReceiverProgress.length)
+            .clamp(0.0, 100.0)
         : 0.0;
 
-    final maxBytes = _hostReceiverBytes.isNotEmpty
-        ? _hostReceiverBytes.values.reduce((a, b) => a > b ? a : b)
+    // Maintain monotonic aggregate displayed progress so late joiners do not jump the bar backwards
+    _displayedProgressPercent =
+        max(_displayedProgressPercent, rawAggregateProgress).clamp(0.0, 100.0);
+
+    // Consistent bytesTransferred derived directly from displayed progress
+    final bytesTransferred = totalBytes > 0
+        ? ((_displayedProgressPercent / 100.0) * totalBytes)
+            .round()
+            .clamp(0, totalBytes)
         : 0;
 
-    final totalSpeed = _hostReceiverSpeed.values.fold(0.0, (sum, s) => sum + s);
-    double effectiveSpeed = totalSpeed;
+    // Sum of bytes delivered across all receivers
+    final totalBytesDelivered =
+        _hostReceiverBytes.values.fold(0, (sum, b) => sum + b);
+
+    final reportedSpeed = _hostReceiverSpeed.values.fold(0.0, (sum, s) => sum + s);
+    double effectiveSpeed = reportedSpeed;
+
     final now = DateTime.now();
-    if (_lastHostSnapshotTime != null && _lastHostBytesTransferred < maxBytes) {
+    if (_lastHostSnapshotTime != null) {
       final elapsedMs = now.difference(_lastHostSnapshotTime!).inMilliseconds;
-      if (elapsedMs > 200) {
-        final bytesDiff = maxBytes - _lastHostBytesTransferred;
-        final calculatedSpeed = (bytesDiff / (1024 * 1024)) / (elapsedMs / 1000.0);
-        if (calculatedSpeed > effectiveSpeed) {
-          effectiveSpeed = calculatedSpeed;
+      if (elapsedMs >= 200) {
+        final bytesDiff = totalBytesDelivered - _lastHostBytesTransferred;
+        if (bytesDiff > 0 && elapsedMs < 10000) {
+          final instantSpeed =
+              (bytesDiff / (1024 * 1024)) / (elapsedMs / 1000.0);
+          if (instantSpeed > effectiveSpeed) {
+            effectiveSpeed = instantSpeed;
+          }
         }
+        if (_lastEffectiveSpeed > 0) {
+          effectiveSpeed = 0.7 * effectiveSpeed + 0.3 * _lastEffectiveSpeed;
+        }
+        _lastHostSnapshotTime = now;
+        _lastHostBytesTransferred = totalBytesDelivered;
+        _lastEffectiveSpeed = effectiveSpeed;
       }
-    }
-    _lastHostSnapshotTime = now;
-    _lastHostBytesTransferred = maxBytes;
-
-    int remainingSec = 0;
-    final remainingBytes = totalBytes - maxBytes;
-    if (remainingBytes > 0 && effectiveSpeed > 0.05) {
-      remainingSec = (remainingBytes / (effectiveSpeed * 1024 * 1024)).ceil();
-    } else if (remainingBytes <= 0) {
-      remainingSec = 0;
     } else {
-      remainingSec = -1;
+      _lastHostSnapshotTime = now;
+      _lastHostBytesTransferred = totalBytesDelivered;
+      _lastEffectiveSpeed = effectiveSpeed;
     }
 
-    final isAllCompleted = _hostReceiverProgress.isNotEmpty &&
+    // Truthful completion decision based on real receiver progress, not clamped display percentage
+    final hasRequiredReceivers = _activeReceivers.isNotEmpty
+        ? expectedPeerIds.every((id) => (_hostReceiverProgress[id] ?? 0.0) >= 100.0)
+        : (connectedPeerIds.isNotEmpty
+            ? connectedPeerIds.every((id) => (_hostReceiverProgress[id] ?? 0.0) >= 100.0)
+            : (_hostReceiverProgress.isNotEmpty &&
+                _hostReceiverProgress.values.every((p) => p >= 100.0)));
+
+    final isAllCompleted = hasRequiredReceivers &&
+        _hostReceiverProgress.isNotEmpty &&
         _hostReceiverProgress.values.every((p) => p >= 100.0);
+
+    final hasFailed = connected.isNotEmpty &&
+        connected.every((r) => r.status == ReceiverStatus.failed);
 
     if (isAllCompleted) {
       if (_hostCompletedEmitted) return;
       _hostCompletedEmitted = true;
-      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      effectiveSpeed = 0.0;
+      final sId = _activeSessionId;
+      final bId = _activeBatchManifest?.batchId;
       if (sId != null) {
         unawaited(ManagedTemporaryFileService.instance.cleanupSession(
           sId,
           reason: 'host_transfer_completed',
         ));
       }
+      if (bId != null && bId != sId) {
+        unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+          bId,
+          reason: 'host_transfer_completed',
+        ));
+      }
+    }
+
+    // ETA calculation corresponding to the exact same progress metric
+    int remainingSec = -1;
+    final remainingBytes = totalBytes - bytesTransferred;
+    if (isAllCompleted || remainingBytes <= 0) {
+      remainingSec = 0;
+    } else if (effectiveSpeed > 0.05) {
+      remainingSec = (remainingBytes / (effectiveSpeed * 1024 * 1024)).ceil();
+    } else {
+      remainingSec = -1; // Waiting / unknown ETA
     }
 
     _currentSnapshot = TransferProgressSnapshot(
       sessionId: _activeBatchManifest!.batchId,
       isHost: true,
-      status: isAllCompleted ? TransferStatus.completed : TransferStatus.transferring,
-      progressPercent: isAllCompleted ? 100.0 : avgProgress,
+      status: isAllCompleted
+          ? TransferStatus.completed
+          : (hasFailed ? TransferStatus.failed : TransferStatus.transferring),
+      progressPercent: isAllCompleted ? 100.0 : _displayedProgressPercent,
       speedMbPerSec: isAllCompleted ? 0.0 : effectiveSpeed,
-      bytesTransferred: isAllCompleted ? totalBytes : maxBytes,
+      bytesTransferred: isAllCompleted ? totalBytes : bytesTransferred,
       totalBytes: totalBytes,
-      remainingSeconds: isAllCompleted ? 0 : remainingSec,
+      remainingSeconds: remainingSec,
       completedFiles: isAllCompleted ? totalFiles : 0,
       totalFiles: totalFiles,
       currentFileName: _activeFileInfo?.name ?? '',
-      receiverProgressMap: Map.from(_hostReceiverProgress),
+      receiverProgressMap: Map.unmodifiable(_hostReceiverProgress),
       connectedReceivers: _activeServer?.connectedReceivers ?? [],
     );
     _emitSnapshot();
@@ -566,10 +683,17 @@ class TransferSessionManager {
         _activeServer!.clearBatch();
         _activeServer!.removeControlListener(_handleHostControlMessage);
       }
-      final sId = _activeSessionId ?? _activeBatchManifest?.batchId;
+      final sId = _activeSessionId;
+      final bId = _activeBatchManifest?.batchId;
       if (sId != null) {
         await ManagedTemporaryFileService.instance.cleanupSession(
           sId,
+          reason: 'host_session_cancelled',
+        );
+      }
+      if (bId != null && bId != sId) {
+        await ManagedTemporaryFileService.instance.cleanupSession(
+          bId,
           reason: 'host_session_cancelled',
         );
       }
@@ -596,10 +720,17 @@ class TransferSessionManager {
   }
 
   void _cleanExistingSession() {
-    final oldSessionId = _activeSessionId ?? _activeBatchManifest?.batchId;
+    final oldSessionId = _activeSessionId;
+    final oldBatchId = _activeBatchManifest?.batchId;
     if (oldSessionId != null && _isHost) {
       unawaited(ManagedTemporaryFileService.instance.cleanupSession(
         oldSessionId,
+        reason: 'host_session_replaced',
+      ));
+    }
+    if (oldBatchId != null && oldBatchId != oldSessionId && _isHost) {
+      unawaited(ManagedTemporaryFileService.instance.cleanupSession(
+        oldBatchId,
         reason: 'host_session_replaced',
       ));
     }
@@ -607,10 +738,13 @@ class TransferSessionManager {
     _activeSub = null;
     _serverReceiversSub?.cancel();
     _serverReceiversSub = null;
+    _hostReceiverProgress.clear();
     _hostReceiverBytes.clear();
     _hostReceiverSpeed.clear();
     _lastHostSnapshotTime = null;
     _lastHostBytesTransferred = 0;
+    _lastEffectiveSpeed = 0.0;
+    _displayedProgressPercent = 0.0;
     _hostCompletedEmitted = false;
     if (_activeServer != null) {
       _activeServer!.removeControlListener(_handleHostControlMessage);

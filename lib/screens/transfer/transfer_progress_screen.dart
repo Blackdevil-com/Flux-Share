@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:math';
 import 'package:flutter/material.dart';
 import '../../ai/ai_models.dart';
 import '../../ai/ai_service.dart';
@@ -273,17 +274,22 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
     final peerId = msg['peerId'] as String? ?? 'receiver';
 
     if (type == 'TRANSFER_PROGRESS') {
-      final percent = (msg['percent'] as num?)?.toDouble() ?? 0.0;
+      if (TransferSessionManager.instance.hasActiveSession) {
+        // TransferSessionManager coordinates the host session and emits unified snapshots
+        return;
+      }
+      final percent = ((msg['percent'] as num?)?.toDouble() ?? 0.0).clamp(0.0, 100.0);
       final bytes = (msg['bytesTransferred'] as num?)?.toInt() ?? 0;
       final speed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
           (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
 
       setState(() {
-        _receiverProgressMap[peerId] = percent;
+        final currentProgress = _receiverProgressMap[peerId] ?? 0.0;
+        _receiverProgressMap[peerId] = max(currentProgress, percent);
         if (_receiverProgressMap.isNotEmpty) {
           final avg = _receiverProgressMap.values.reduce((a, b) => a + b) /
               _receiverProgressMap.length;
-          _progressPercent = avg;
+          _progressPercent = max(_progressPercent, avg);
         }
         if (bytes > _bytesTransferred) {
           _bytesTransferred = bytes;
