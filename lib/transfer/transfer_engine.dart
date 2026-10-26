@@ -1,3 +1,5 @@
+import '../models/transfer_failure_reason.dart';
+import '../services/storage_diagnostics_service.dart';
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
@@ -28,6 +30,7 @@ class TransferProgressEvent {
   final double speedMbPerSec;
   final int remainingSeconds;
   final String? errorMessage;
+  final TransferFailureReason? failureReason;
   final bool isPreviewReady;
 
   const TransferProgressEvent({
@@ -39,6 +42,7 @@ class TransferProgressEvent {
     required this.speedMbPerSec,
     required this.remainingSeconds,
     this.errorMessage,
+    this.failureReason,
     this.isPreviewReady = false,
   });
 }
@@ -77,6 +81,11 @@ class TransferEngine {
   Completer<bool>? _completionCompleter;
   Timer? _progressTimer;
   bool _isPreviewReady = false;
+  TransferFailureReason? _lastFailureReason;
+  String? _lastErrorMessage;
+
+  TransferFailureReason? get lastFailureReason => _lastFailureReason;
+  String? get lastErrorMessage => _lastErrorMessage;
 
   final _progressController = StreamController<TransferProgressEvent>.broadcast();
 
@@ -145,6 +154,16 @@ class TransferEngine {
     );
 
     try {
+      // 0. Destination storage pre-check (Part A6)
+      final availableSpace = await StorageDiagnosticsService().getAvailableStorageBytes(destinationFile.parent.path);
+      if (availableSpace != null && availableSpace < manifest.fileSize + (20 * 1024 * 1024)) {
+        _handleFatalError(
+          'Not enough storage space on device. Required: ${manifest.formattedSize}',
+          failureReason: TransferFailureReason.diskSpaceInsufficient,
+        );
+        return false;
+      }
+
       // 1. Open writer session & preallocate full size immediately
       await _writerSession.open();
 
@@ -346,15 +365,25 @@ class TransferEngine {
   }
 
   /// Handles chunk failure: Multiplicative Decrease, Cooldown, scheduler feedback, and immediate reassignment.
-  void _handleChunkFailure(int chunkId, String sourcePeerId, String reason) {
+  void _handleChunkFailure(int chunkId, String sourcePeerId, String reason, {TransferFailureReason? failureReason}) {
     if (_status == TransferStatus.cancelled) return;
+
+    _lastFailureReason = failureReason ?? TransferFailureReason.unknown;
+    _lastErrorMessage = reason;
 
     final failures = (_chunkFailureCounts[chunkId] ?? 0) + 1;
     _chunkFailureCounts[chunkId] = failures;
 
+    // Fail immediately on non-transient fatal errors (e.g., disk write failure, insufficient space)
+    if (failureReason != null && !failureReason.isTransient) {
+      _chunkStates[chunkId] = ChunkState.failed;
+      _handleFatalError(reason, failureReason: failureReason);
+      return;
+    }
+
     if (failures >= 5) {
       _chunkStates[chunkId] = ChunkState.failed;
-      _handleFatalError('Chunk $chunkId failed after 5 retry attempts: $reason');
+      _handleFatalError('Chunk $chunkId failed after 5 retry attempts: $reason', failureReason: TransferFailureReason.retriesExhausted);
       return;
     }
 
@@ -464,8 +493,10 @@ class TransferEngine {
     }
   }
 
-  void _handleFatalError(String errorMsg) {
+  void _handleFatalError(String errorMsg, {TransferFailureReason? failureReason}) {
     _status = TransferStatus.failed;
+    _lastErrorMessage = errorMsg;
+    _lastFailureReason = failureReason ?? TransferFailureReason.unknown;
     _progressTimer?.cancel();
     _transferStopwatch.stop();
     _writerSession.close();
@@ -475,7 +506,7 @@ class TransferEngine {
     }
     _workers.clear();
 
-    _emitProgress(errorMessage: errorMsg);
+    _emitProgress(errorMessage: errorMsg, failureReason: _lastFailureReason);
     if (_completionCompleter != null && !_completionCompleter!.isCompleted) {
       _completionCompleter!.complete(false);
     }
@@ -518,6 +549,15 @@ class TransferEngine {
     await _writerSession.close();
     _sharedDownloader.close();
 
+    // If cancelled before any verified chunks were committed, remove empty preallocated file
+    if (_verifiedChunks.isEmpty) {
+      try {
+        if (await destinationFile.exists()) {
+          await destinationFile.delete();
+        }
+      } catch (_) {}
+    }
+
     try {
       webSocketService?.notifyTransferCancelled();
     } catch (_) {}
@@ -528,7 +568,7 @@ class TransferEngine {
     }
   }
 
-  void _emitProgress({String? errorMessage}) {
+  void _emitProgress({String? errorMessage, TransferFailureReason? failureReason}) {
     final metrics = _metricsCalculator.update(
       totalBytesTransferred: _bytesTransferred,
       totalFileSize: manifest.fileSize,
@@ -542,7 +582,8 @@ class TransferEngine {
       totalBytes: manifest.fileSize,
       speedMbPerSec: metrics.smoothedSpeedMbPerSec,
       remainingSeconds: metrics.remainingSeconds,
-      errorMessage: errorMessage,
+      errorMessage: errorMessage ?? _lastErrorMessage,
+      failureReason: failureReason ?? _lastFailureReason,
       isPreviewReady: _isPreviewReady,
     );
 
@@ -562,6 +603,7 @@ class TransferEngine {
         for (int i = startIdx; i < maxWorkers; i++) {
           final worker = TransferWorker(
             workerId: 'worker_$i',
+            fileId: manifest.fileId,
             reservationManager: _reservationManager,
             writerSession: _writerSession,
             downloader: _sharedDownloader,

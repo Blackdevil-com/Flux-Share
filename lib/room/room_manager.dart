@@ -74,7 +74,7 @@ class RoomManager {
     BatchManifest? batchManifest,
   }) {
     final pin = customPin ?? generatePin();
-    final roomId = 'room_${DateTime.now().millisecondsSinceEpoch}';
+    final roomId = 'room_${DateTime.now().microsecondsSinceEpoch}';
 
     final room = RoomSession(
       roomId: roomId,

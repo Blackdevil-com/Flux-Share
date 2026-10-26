@@ -1,3 +1,4 @@
+import '../services/storage_diagnostics_service.dart';
 import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
@@ -93,21 +94,37 @@ class FilePickerService {
       final f = result.files.first;
       final String? identifier = f.identifier;
       File? resolvedFile;
-      if (f.path != null && f.path!.isNotEmpty) {
+      if (f.path != null && f.path!.isNotEmpty && File(f.path!).existsSync()) {
         resolvedFile = File(f.path!);
       } else if (f.readStream != null) {
         final tempDir = Directory.systemTemp;
         final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-        final sink = resolvedFile.openWrite();
-        await f.readStream!.pipe(sink);
-        debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
+        final stableKey = identifier != null
+            ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
+            : '${f.size}';
+        resolvedFile = File('${tempDir.path}/fluxshare_tmp_${stableKey}_$safeName');
+        if (await resolvedFile.exists() && await resolvedFile.length() == f.size) {
+          StorageDiagnosticsService().markTempFileReused(resolvedFile.path);
+        } else {
+          final sink = resolvedFile.openWrite();
+          await f.readStream!.pipe(sink);
+          StorageDiagnosticsService().registerTempFile(resolvedFile.path, f.size);
+          debugPrint('[FluxShare] Streamed non-path file "${f.name}" to managed temp: ${resolvedFile.path}');
+        }
       } else if (f.bytes != null) {
         final tempDir = Directory.systemTemp;
         final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
-        resolvedFile = File('${tempDir.path}/cached_${DateTime.now().millisecondsSinceEpoch}_$safeName');
-        await resolvedFile.writeAsBytes(f.bytes!, flush: true);
-        debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
+        final stableKey = identifier != null
+            ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
+            : '${f.size}';
+        resolvedFile = File('${tempDir.path}/fluxshare_tmp_${stableKey}_$safeName');
+        if (await resolvedFile.exists() && await resolvedFile.length() == f.size) {
+          StorageDiagnosticsService().markTempFileReused(resolvedFile.path);
+        } else {
+          await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+          StorageDiagnosticsService().registerTempFile(resolvedFile.path, f.size);
+          debugPrint('[FluxShare] Resolved non-path file "${f.name}" to managed temp: ${resolvedFile.path}');
+        }
       }
 
       if (resolvedFile != null) {
@@ -185,7 +202,7 @@ class FilePickerService {
       for (final f in result.files) {
         final String? identifier = f.identifier;
         File? resolvedFile;
-        if (f.path != null && f.path!.isNotEmpty) {
+        if (f.path != null && f.path!.isNotEmpty && File(f.path!).existsSync()) {
           resolvedFile = File(f.path!);
         } else if (f.readStream != null) {
           final tempDir = Directory.systemTemp;
@@ -193,23 +210,29 @@ class FilePickerService {
           final stableKey = identifier != null
               ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
               : '${f.size}';
-          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
-          if (!await resolvedFile.exists()) {
+          resolvedFile = File('${tempDir.path}/fluxshare_tmp_${stableKey}_$safeName');
+          if (await resolvedFile.exists() && await resolvedFile.length() == f.size) {
+            StorageDiagnosticsService().markTempFileReused(resolvedFile.path);
+          } else {
             final sink = resolvedFile.openWrite();
             await f.readStream!.pipe(sink);
+            StorageDiagnosticsService().registerTempFile(resolvedFile.path, f.size);
+            debugPrint('[FluxShare] Streamed non-path file "${f.name}" to managed temp: ${resolvedFile.path}');
           }
-          debugPrint('[FluxShare] Streamed non-path file "${f.name}" to cache: ${resolvedFile.path}');
         } else if (f.bytes != null) {
           final tempDir = Directory.systemTemp;
           final safeName = f.name.replaceAll(RegExp(r'[^\w\.-]'), '_');
           final stableKey = identifier != null
               ? sha256.convert(utf8.encode(identifier)).toString().substring(0, 16)
               : '${f.size}';
-          resolvedFile = File('${tempDir.path}/cached_${stableKey}_$safeName');
-          if (!await resolvedFile.exists()) {
+          resolvedFile = File('${tempDir.path}/fluxshare_tmp_${stableKey}_$safeName');
+          if (await resolvedFile.exists() && await resolvedFile.length() == f.size) {
+            StorageDiagnosticsService().markTempFileReused(resolvedFile.path);
+          } else {
             await resolvedFile.writeAsBytes(f.bytes!, flush: true);
+            StorageDiagnosticsService().registerTempFile(resolvedFile.path, f.size);
+            debugPrint('[FluxShare] Resolved non-path file "${f.name}" to managed temp: ${resolvedFile.path}');
           }
-          debugPrint('[FluxShare] Resolved non-path file "${f.name}" to cache: ${resolvedFile.path}');
         }
 
         if (resolvedFile != null) {

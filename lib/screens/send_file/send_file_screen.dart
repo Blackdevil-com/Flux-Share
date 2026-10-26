@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 import 'package:flutter/material.dart';
@@ -10,6 +11,7 @@ import '../../file/session_manifest_cache.dart';
 import '../../models/batch_manifest.dart';
 import '../../models/device.dart';
 import '../../models/file_info.dart';
+import '../../models/connected_receiver.dart';
 import '../../models/manifest.dart';
 import '../../network/local_server.dart';
 import '../../network/network_utils.dart';
@@ -121,6 +123,10 @@ class _SendFileScreenState extends State<SendFileScreen> {
   bool _isLoadingDevices = true;
   late String _roomPin;
   String _hostAddress = '';
+  bool _isHostingStarted = false;
+  bool _navigatedToTransfer = false;
+  List<ConnectedReceiver> _connectedReceivers = [];
+  StreamSubscription<List<ConnectedReceiver>>? _receiversSub;
 
   @override
   void initState() {
@@ -162,6 +168,12 @@ class _SendFileScreenState extends State<SendFileScreen> {
     }
     _sessionCache.clear();
     _manifestUpdateNotifier.dispose();
+    _receiversSub?.cancel();
+    if (!_navigatedToTransfer && _isHostingStarted) {
+      _discoveryService.stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch();
+    }
     super.dispose();
   }
 
@@ -845,6 +857,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
           targetItem.errorMessage = null;
         });
         _manifestUpdateNotifier.value++;
+        if (_selectedFiles.every((i) => i.isReady)) {
+          _startHostingRoom();
+        }
         debugPrint('[FluxShare-Diag] [B9:StateTransition] jobId=$activeJobId, file=${targetItem.info.name}, to=manifestReady');
       } else {
         outcome = 'cancelled_on_completion';
@@ -938,6 +953,55 @@ class _SendFileScreenState extends State<SendFileScreen> {
     }
   }
 
+  Future<void> _startHostingRoom() async {
+    if (_isHostingStarted || !_canStartTransfer) return;
+    try {
+      final List<Manifest> manifests = _selectedFiles.map((i) => i.manifest!).toList();
+      final List<({Manifest manifest, File file})> batchItems =
+          _selectedFiles.map((i) => (manifest: i.manifest!, file: i.file)).toList();
+
+      final batchManifest = BatchManifest(
+        batchId: 'batch_${DateTime.now().millisecondsSinceEpoch}',
+        manifests: manifests,
+      );
+
+      final server = LocalServer();
+      final port = await server.start();
+      server.replaceBatchManifests(batchManifest.batchId, batchItems);
+
+      final hostResult = await _discoveryService.startRoomHost(
+        pin: _roomPin,
+        roomId: batchManifest.batchId,
+        serverPort: port,
+        deviceName: server.localDeviceName,
+      );
+      if (hostResult is RoomHostStartFailure) {
+        debugPrint('[FluxShare] Early host discovery start notice: ${hostResult.reason}');
+      }
+
+      RoomManager().createRoom(
+        hostPeerId: server.localPeerId,
+        hostDeviceName: server.localDeviceName,
+        customPin: _roomPin,
+        manifest: manifests.first,
+        batchManifest: batchManifest,
+      );
+
+      _receiversSub?.cancel();
+      _receiversSub = server.connectedReceiversStream.listen((list) {
+        if (!mounted) return;
+        setState(() {
+          _connectedReceivers = list;
+        });
+      });
+
+      _isHostingStarted = true;
+      if (mounted) setState(() {});
+    } catch (e) {
+      debugPrint('[FluxShare] Error starting room host early: $e');
+    }
+  }
+
   Future<void> _startTransfer() async {
     debugPrint('[FluxShare] Start Transfer received: ${_selectedFiles.length} files');
     if (!_canStartTransfer) {
@@ -964,7 +1028,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
       final server = LocalServer();
       final port = await server.start();
-      server.setBatchManifests(batchItems);
+      server.replaceBatchManifests(batchManifest.batchId, batchItems);
 
       final hostResult = await _discoveryService.startRoomHost(
         pin: _roomPin,
@@ -999,12 +1063,18 @@ class _SendFileScreenState extends State<SendFileScreen> {
           .where((d) => _selectedDeviceIds.contains(d.id))
           .toList();
 
+      server.broadcastTransferStart(
+        sessionId: batchManifest.batchId,
+      );
+
       await TransferSessionManager.instance.startHostSession(
         server: server,
         batchManifest: batchManifest,
         receivers: selectedDevices,
         roomPin: _roomPin,
       );
+
+      _navigatedToTransfer = true;
 
       if (mounted) {
         await Navigator.of(context).pushReplacement(
@@ -1023,6 +1093,9 @@ class _SendFileScreenState extends State<SendFileScreen> {
         );
       }
     } catch (e) {
+      _discoveryService.stopRoomHost();
+      RoomManager().expireRoom();
+      LocalServer().clearBatch();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Error preparing transfer: $e')),
@@ -1327,6 +1400,137 @@ class _SendFileScreenState extends State<SendFileScreen> {
               fontSize: 12,
             ),
           ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildConnectedReceiversSection() {
+    if (!_isHostingStarted) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(top: 12),
+      padding: const EdgeInsets.all(AppSpacing.s16),
+      decoration: BoxDecoration(
+        color: AppColors.lightGray,
+        borderRadius: AppShapes.cardBorderRadius,
+        border: Border.all(color: AppColors.borderGray),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.devices_rounded, size: 18, color: AppColors.primaryBlack),
+                  const SizedBox(width: 8),
+                  Text(
+                    'Connected Receivers (${_connectedReceivers.length})',
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: AppColors.primaryBlack,
+                    ),
+                  ),
+                ],
+              ),
+              if (_connectedReceivers.any((r) => r.status == ReceiverStatus.ready))
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.green.shade100,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    '${_connectedReceivers.where((r) => r.status == ReceiverStatus.ready).length} Ready',
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.bold,
+                      color: Colors.green.shade900,
+                    ),
+                  ),
+                ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          if (_connectedReceivers.isEmpty) ...[
+            Row(
+              children: [
+                const SizedBox(
+                  width: 14,
+                  height: 14,
+                  child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.mediumGray),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    'Waiting for receivers to enter PIN $_roomPin...',
+                    style: const TextStyle(fontSize: 12, color: AppColors.mediumGray),
+                  ),
+                ),
+              ],
+            ),
+          ] else ...[
+            Column(
+              children: _connectedReceivers.map((r) {
+                return Container(
+                  margin: const EdgeInsets.only(bottom: 6),
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                  decoration: BoxDecoration(
+                    color: AppColors.backgroundWhite,
+                    borderRadius: BorderRadius.circular(8),
+                    border: Border.all(color: AppColors.borderGray),
+                  ),
+                  child: Row(
+                    children: [
+                      Icon(
+                        r.platform == DevicePlatform.iPhone
+                            ? Icons.phone_iphone_rounded
+                            : Icons.phone_android_rounded,
+                        size: 16,
+                        color: AppColors.primaryBlack,
+                      ),
+                      const SizedBox(width: 8),
+                      Expanded(
+                        child: Text(
+                          r.deviceName,
+                          style: const TextStyle(fontSize: 13, fontWeight: FontWeight.w600),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                      ),
+                      Container(
+                        padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                        decoration: BoxDecoration(
+                          color: r.status == ReceiverStatus.ready
+                              ? Colors.green.shade100
+                              : (r.status == ReceiverStatus.failed
+                                  ? Colors.red.shade100
+                                  : Colors.blue.shade100),
+                          borderRadius: BorderRadius.circular(6),
+                        ),
+                        child: Text(
+                          r.status.displayName,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                            color: r.status == ReceiverStatus.ready
+                                ? Colors.green.shade900
+                                : (r.status == ReceiverStatus.failed
+                                    ? Colors.red.shade900
+                                    : Colors.blue.shade900),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                );
+              }).toList(),
+            ),
+          ],
         ],
       ),
     );
@@ -1720,6 +1924,7 @@ class _SendFileScreenState extends State<SendFileScreen> {
 
                       // 2. Room PIN Display Card
                       _buildRoomPinCard(),
+                      _buildConnectedReceiversSection(),
                       const SizedBox(height: AppSpacing.s20),
 
                       // 3. Selected Files Section (Cards below Room PIN)

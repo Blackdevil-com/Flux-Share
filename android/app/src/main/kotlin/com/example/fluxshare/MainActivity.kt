@@ -93,6 +93,22 @@ class MainActivity : FlutterActivity() {
                         result.success(TransferForegroundService.isServiceRunning)
                     }
 
+                    "getAvailableStorageBytes" -> {
+                        val path = call.argument<String>("path") ?: context.filesDir.absolutePath
+                        try {
+                            val stat = android.os.StatFs(path)
+                            val bytesAvailable = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR2) {
+                                stat.availableBytes
+                            } else {
+                                @Suppress("DEPRECATION")
+                                (stat.availableBlocks.toLong() * stat.blockSize.toLong())
+                            }
+                            result.success(bytesAvailable)
+                        } catch (e: Exception) {
+                            result.error("STATFS_FAILED", e.message, null)
+                        }
+                    }
+
                     else -> {
                         result.notImplemented()
                     }

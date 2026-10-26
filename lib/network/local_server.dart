@@ -6,6 +6,8 @@ import 'package:shelf/shelf_io.dart' as shelf_io;
 import 'package:shelf_router/shelf_router.dart';
 import 'package:shelf_web_socket/shelf_web_socket.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
+import '../models/connected_receiver.dart';
+import '../models/device.dart';
 import '../models/manifest.dart';
 import '../models/peer.dart';
 import 'network_utils.dart';
@@ -33,32 +35,128 @@ class LocalServer {
   final Map<String, File> _sourceFiles = <String, File>{};
   final Map<String, Set<int>> _verifiedChunksByFile = <String, Set<int>>{};
 
+  String? _activeBatchId;
+  String? get activeBatchId => _activeBatchId;
+  bool get hasActiveBatch => _activeBatchId != null && _manifests.isNotEmpty;
+
   String? _primaryFileId;
   Manifest? get currentManifest =>
-      (_primaryFileId != null ? _manifests[_primaryFileId] : null) ??
-      _manifests.values.firstOrNull;
+      _activeBatchId == null
+          ? null
+          : ((_primaryFileId != null ? _manifests[_primaryFileId] : null) ??
+              _manifests.values.firstOrNull);
   File? get currentSourceFile =>
-      (_primaryFileId != null ? _sourceFiles[_primaryFileId] : null) ??
-      _sourceFiles.values.firstOrNull;
+      _activeBatchId == null
+          ? null
+          : ((_primaryFileId != null ? _sourceFiles[_primaryFileId] : null) ??
+              _sourceFiles.values.firstOrNull);
   final Set<int> verifiedChunks = <int>{};
   final Map<String, PeerInfo> knownPeers = <String, PeerInfo>{};
 
   final List<WebSocketChannel> _activeWsClients = [];
   final List<ControlMessageHandler> _controlListeners = [];
 
-  void setManifest(Manifest manifest, File file) {
-    _primaryFileId = manifest.fileId;
-    _manifests[manifest.fileId] = manifest;
-    _sourceFiles[manifest.fileId] = file;
-    final fileChunks = _verifiedChunksByFile.putIfAbsent(manifest.fileId, () => <int>{});
-    fileChunks.addAll(manifest.chunks.map((c) => c.chunkId));
-    verifiedChunks.addAll(manifest.chunks.map((c) => c.chunkId));
+  bool _transferStarted = false;
+  bool get isTransferStarted => _transferStarted;
+
+  final Map<String, ConnectedReceiver> _connectedReceivers = {};
+  final Map<WebSocketChannel, String> _channelPeerMap = {};
+  final StreamController<List<ConnectedReceiver>> _connectedReceiversController =
+      StreamController<List<ConnectedReceiver>>.broadcast();
+
+  List<ConnectedReceiver> get connectedReceivers =>
+      List.unmodifiable(_connectedReceivers.values);
+  Stream<List<ConnectedReceiver>> get connectedReceiversStream =>
+      _connectedReceiversController.stream;
+
+  void broadcastTransferStart({
+    required String sessionId,
+    List<String>? authorizedReceivers,
+  }) {
+    _transferStarted = true;
+    broadcastMessage({
+      'type': 'TRANSFER_START',
+      'sessionId': sessionId,
+      if (authorizedReceivers != null) 'authorizedReceivers': authorizedReceivers,
+    });
   }
 
-  void setBatchManifests(List<({Manifest manifest, File file})> batch) {
-    for (final item in batch) {
-      setManifest(item.manifest, item.file);
+  void updateReceiver(ConnectedReceiver receiver) {
+    _connectedReceivers[receiver.peerId] = receiver;
+    _connectedReceiversController.add(connectedReceivers);
+  }
+
+  void clearReceivers() {
+    _connectedReceivers.clear();
+    _channelPeerMap.clear();
+    _transferStarted = false;
+    _connectedReceiversController.add([]);
+  }
+
+  /// Replaces the active batch atomically. Validates items, clears previous batch data,
+  /// and establishes the new batch manifest and source file mappings.
+  void replaceBatchManifests(String batchId, List<({Manifest manifest, File file})> batch) {
+    if (batch.isEmpty) {
+      throw ArgumentError('Batch cannot be empty');
     }
+
+    final newManifests = <String, Manifest>{};
+    final newSourceFiles = <String, File>{};
+    final newVerifiedChunksByFile = <String, Set<int>>{};
+    final newVerifiedChunks = <int>{};
+
+    for (final item in batch) {
+      final m = item.manifest;
+      final f = item.file;
+      if (newManifests.containsKey(m.fileId)) {
+        throw ArgumentError('Duplicate fileId in batch: ${m.fileId}');
+      }
+      newManifests[m.fileId] = m;
+      newSourceFiles[m.fileId] = f;
+      final chunks = m.chunks.map((c) => c.chunkId).toSet();
+      newVerifiedChunksByFile[m.fileId] = chunks;
+      newVerifiedChunks.addAll(chunks);
+    }
+
+    _manifests.clear();
+    _manifests.addAll(newManifests);
+
+    _sourceFiles.clear();
+    _sourceFiles.addAll(newSourceFiles);
+
+    _verifiedChunksByFile.clear();
+    _verifiedChunksByFile.addAll(newVerifiedChunksByFile);
+
+    verifiedChunks.clear();
+    verifiedChunks.addAll(newVerifiedChunks);
+
+    _primaryFileId = batch.first.manifest.fileId;
+    _activeBatchId = batchId;
+  }
+
+  /// Completely clears active batch metadata, manifests, source files, and chunk indexes.
+  void clearBatch() {
+    clearReceivers();
+    _activeBatchId = null;
+    _primaryFileId = null;
+    _manifests.clear();
+    _sourceFiles.clear();
+    _verifiedChunksByFile.clear();
+    verifiedChunks.clear();
+  }
+
+  /// Sets single manifest for backward compatibility by replacing the active batch.
+  void setManifest(Manifest manifest, File file) {
+    replaceBatchManifests(manifest.fileId, [(manifest: manifest, file: file)]);
+  }
+
+  /// Sets multiple batch manifests, replacing any previously active batch.
+  void setBatchManifests(List<({Manifest manifest, File file})> batch) {
+    if (batch.isEmpty) {
+      clearBatch();
+      return;
+    }
+    replaceBatchManifests('batch_${DateTime.now().millisecondsSinceEpoch}', batch);
   }
 
   void setVerifiedChunks(Set<int> chunks, {String? fileId}) {
@@ -126,7 +224,7 @@ class LocalServer {
     // 2a. GET /manifest (single manifest / primary file)
     router.get('/manifest', (Request request) {
       final m = currentManifest;
-      if (m != null) {
+      if (m != null && _activeBatchId != null) {
         return Response.ok(
           jsonEncode(m.toJson()),
           headers: {'content-type': 'application/json'},
@@ -141,11 +239,11 @@ class LocalServer {
 
     // 2b. GET /manifests or /batch-manifest (full batch manifest)
     router.get('/manifests', (Request request) {
-      if (_manifests.isNotEmpty) {
+      if (_manifests.isNotEmpty && _activeBatchId != null) {
         final list = _manifests.values.map((m) => m.toJson()).toList();
         return Response.ok(
           jsonEncode({
-            'batchId': _manifests.keys.first,
+            'batchId': _activeBatchId!,
             'totalFiles': _manifests.length,
             'totalBytes': _manifests.values.fold(0, (sum, m) => sum + m.fileSize),
             'manifests': list,
@@ -161,11 +259,11 @@ class LocalServer {
     });
 
     router.get('/batch-manifest', (Request request) {
-      if (_manifests.isNotEmpty) {
+      if (_manifests.isNotEmpty && _activeBatchId != null) {
         final list = _manifests.values.map((m) => m.toJson()).toList();
         return Response.ok(
           jsonEncode({
-            'batchId': _manifests.keys.first,
+            'batchId': _activeBatchId!,
             'totalFiles': _manifests.length,
             'totalBytes': _manifests.values.fold(0, (sum, m) => sum + m.fileSize),
             'manifests': list,
@@ -182,6 +280,12 @@ class LocalServer {
 
     // 2c. GET /file/<fileId>/manifest
     router.get('/file/<fileId>/manifest', (Request request, String fileId) {
+      if (_activeBatchId == null) {
+        return Response.notFound(
+          jsonEncode({'error': 'MANIFEST_NOT_READY', 'message': 'No active batch'}),
+          headers: {'content-type': 'application/json'},
+        );
+      }
       final m = _manifests[fileId];
       if (m != null) {
         return Response.ok(
@@ -189,11 +293,17 @@ class LocalServer {
           headers: {'content-type': 'application/json'},
         );
       }
-      return Response.notFound('Manifest for file $fileId not found');
+      return Response.notFound(
+        jsonEncode({'error': 'FILE_NOT_FOUND', 'message': 'Manifest for file $fileId not found'}),
+        headers: {'content-type': 'application/json'},
+      );
     });
 
     // 3a. GET /file/<fileId>/chunk/<chunkId> (Multi-file isolated streaming)
     router.get('/file/<fileId>/chunk/<chunkId>', (Request request, String fileId, String chunkIdStr) async {
+      if (_activeBatchId == null) {
+        return Response.notFound('No active batch');
+      }
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
         return Response.notFound('Invalid chunk ID');
@@ -232,6 +342,9 @@ class LocalServer {
 
     // 3b. GET /chunk/<chunkId> (Single-file legacy streaming)
     router.get('/chunk/<chunkId>', (Request request, String chunkIdStr) async {
+      if (_activeBatchId == null) {
+        return Response.notFound('No active batch');
+      }
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
         return Response.notFound('Invalid chunk ID');
@@ -323,19 +436,139 @@ class LocalServer {
       };
       channel.sink.add(jsonEncode(hostStateMessage));
 
+      if (_transferStarted) {
+        channel.sink.add(jsonEncode({
+          'type': 'TRANSFER_START',
+          'sessionId': _activeBatchId ?? 'session',
+        }));
+      }
+
       channel.stream.listen(
         (data) {
           try {
             final parsed = jsonDecode(data as String) as Map<String, dynamic>;
+            final type = parsed['type'] as String?;
+            final peerId = parsed['peerId'] as String?;
+
+            if (peerId != null) {
+              _channelPeerMap[channel] = peerId;
+            }
+
+            if (type == 'RECEIVER_JOINED' && peerId != null) {
+              final deviceName = parsed['deviceName'] as String? ?? 'Receiver';
+              final platStr = parsed['platform'] as String? ?? '';
+              final receiverIp = parsed['ip'] as String?;
+              _connectedReceivers[peerId] = ConnectedReceiver(
+                peerId: peerId,
+                deviceName: deviceName,
+                platform: DevicePlatform.fromString(platStr),
+                ip: receiverIp,
+                status: ReceiverStatus.connected,
+                progressPercent: 0.0,
+                bytesReceived: 0,
+                lastSeen: DateTime.now(),
+              );
+              _connectedReceiversController.add(connectedReceivers);
+
+              if (_transferStarted) {
+                channel.sink.add(jsonEncode({
+                  'type': 'TRANSFER_START',
+                  'sessionId': _activeBatchId ?? 'session',
+                }));
+              }
+            } else if (type == 'RECEIVER_READY' && peerId != null) {
+              final existing = _connectedReceivers[peerId];
+              final deviceName = parsed['deviceName'] as String? ?? existing?.deviceName ?? 'Receiver';
+              final platStr = parsed['platform'] as String? ?? '';
+              final receiverIp = parsed['ip'] as String? ?? existing?.ip;
+              _connectedReceivers[peerId] = (existing ?? ConnectedReceiver(
+                peerId: peerId,
+                deviceName: deviceName,
+                platform: DevicePlatform.fromString(platStr),
+                ip: receiverIp,
+                lastSeen: DateTime.now(),
+              )).copyWith(
+                status: ReceiverStatus.ready,
+                lastSeen: DateTime.now(),
+              );
+              _connectedReceiversController.add(connectedReceivers);
+
+              if (_transferStarted) {
+                channel.sink.add(jsonEncode({
+                  'type': 'TRANSFER_START',
+                  'sessionId': _activeBatchId ?? 'session',
+                }));
+              }
+            } else if (type == 'TRANSFER_PROGRESS') {
+              final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
+              final pct = (parsed['percent'] as num?)?.toDouble() ?? 0.0;
+              final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
+              final existing = _connectedReceivers[activePeerId];
+              if (existing != null) {
+                _connectedReceivers[activePeerId] = existing.copyWith(
+                  status: ReceiverStatus.receiving,
+                  progressPercent: pct,
+                  bytesReceived: bytes,
+                  lastSeen: DateTime.now(),
+                );
+                _connectedReceiversController.add(connectedReceivers);
+              }
+            } else if (type == 'TRANSFER_COMPLETED') {
+              final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
+              final existing = _connectedReceivers[activePeerId];
+              if (existing != null) {
+                _connectedReceivers[activePeerId] = existing.copyWith(
+                  status: ReceiverStatus.completed,
+                  progressPercent: 100.0,
+                  lastSeen: DateTime.now(),
+                );
+                _connectedReceiversController.add(connectedReceivers);
+              }
+            } else if (type == 'RECEIVER_FAILED') {
+              final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
+              final error = parsed['error'] as String? ?? 'Receiver failed';
+              final existing = _connectedReceivers[activePeerId];
+              if (existing != null) {
+                _connectedReceivers[activePeerId] = existing.copyWith(
+                  status: ReceiverStatus.failed,
+                  errorMessage: error,
+                  lastSeen: DateTime.now(),
+                );
+                _connectedReceiversController.add(connectedReceivers);
+              }
+            }
+
             for (final listener in List.of(_controlListeners)) {
               listener(parsed);
             }
           } catch (_) {}
         },
         onDone: () {
+          final peerId = _channelPeerMap.remove(channel);
+          if (peerId != null) {
+            final existing = _connectedReceivers[peerId];
+            if (existing != null && existing.status != ReceiverStatus.completed) {
+              _connectedReceivers[peerId] = existing.copyWith(
+                status: ReceiverStatus.disconnected,
+                lastSeen: DateTime.now(),
+              );
+              _connectedReceiversController.add(connectedReceivers);
+            }
+          }
           _activeWsClients.remove(channel);
         },
         onError: (_) {
+          final peerId = _channelPeerMap.remove(channel);
+          if (peerId != null) {
+            final existing = _connectedReceivers[peerId];
+            if (existing != null && existing.status != ReceiverStatus.completed) {
+              _connectedReceivers[peerId] = existing.copyWith(
+                status: ReceiverStatus.disconnected,
+                lastSeen: DateTime.now(),
+              );
+              _connectedReceiversController.add(connectedReceivers);
+            }
+          }
           _activeWsClients.remove(channel);
         },
       );
@@ -361,18 +594,14 @@ class LocalServer {
   }
 
   Future<void> stop() async {
-    for (final client in _activeWsClients) {
+    for (final client in List.of(_activeWsClients)) {
       try {
-        client.sink.close();
+        await client.sink.close();
       } catch (_) {}
     }
     _activeWsClients.clear();
     _controlListeners.clear();
-    _manifests.clear();
-    _sourceFiles.clear();
-    _verifiedChunksByFile.clear();
-    verifiedChunks.clear();
-    _primaryFileId = null;
+    clearBatch();
     await _server?.close(force: true);
     _server = null;
     _port = 0;

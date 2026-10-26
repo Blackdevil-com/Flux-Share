@@ -207,6 +207,9 @@ class BatchTransferCoordinator {
         item.progressPercent = event.progressPercent;
         item.speedMbPerSec = event.speedMbPerSec;
         item.remainingSeconds = event.remainingSeconds;
+        if (event.errorMessage != null && event.errorMessage!.isNotEmpty) {
+          item.errorMessage = event.errorMessage;
+        }
         _emitProgress();
       });
 
@@ -228,9 +231,9 @@ class BatchTransferCoordinator {
         item.completedAt = DateTime.now();
       } else {
         item.status = TransferStatus.failed;
-        item.errorMessage = engine.status == TransferStatus.failed
-            ? 'Verification or chunk download failed'
-            : 'Transfer terminated';
+        item.errorMessage = engine.lastErrorMessage ??
+            engine.lastFailureReason?.toUserMessage() ??
+            (item.errorMessage ?? 'Transfer failed');
       }
 
       _recordHistory(item);
@@ -293,6 +296,9 @@ class BatchTransferCoordinator {
       item.progressPercent = event.progressPercent;
       item.speedMbPerSec = event.speedMbPerSec;
       item.remainingSeconds = event.remainingSeconds;
+      if (event.errorMessage != null && event.errorMessage!.isNotEmpty) {
+        item.errorMessage = event.errorMessage;
+      }
       _emitProgress();
     });
 
@@ -308,7 +314,9 @@ class BatchTransferCoordinator {
       item.completedAt = DateTime.now();
     } else {
       item.status = TransferStatus.failed;
-      item.errorMessage = 'Retry failed verification or connection';
+      item.errorMessage = engine.lastErrorMessage ??
+          engine.lastFailureReason?.toUserMessage() ??
+          'Retry failed';
     }
 
     _recordHistory(item);
@@ -431,6 +439,9 @@ class BatchTransferCoordinator {
     queued = items.length - (completed + active + failed + cancelled);
     if (queued < 0) queued = 0;
 
+    final isAllCompleted = completed == items.length && items.isNotEmpty;
+    final hasFailed = failed > 0;
+
     _progressController.add(
       BatchProgressEvent(
         batchId: batchId,
@@ -445,11 +456,34 @@ class BatchTransferCoordinator {
         overallProgressPercent: overallProgressPercent,
         overallSpeedMbPerSec: currentSpeed,
         items: List.of(items),
-        isCompleted: completed == items.length && items.isNotEmpty,
-        hasFailures: failed > 0,
+        isCompleted: isAllCompleted,
+        hasFailures: hasFailed,
         isPaused: _isPaused,
         isCancelled: _isCancelled,
       ),
     );
+
+    // Synchronize progress to host coordinator in real-time
+    if (webSocketService != null && !isHost && webSocketService!.isConnected) {
+      webSocketService!.send({
+        'type': 'TRANSFER_PROGRESS',
+        'sessionId': batchId,
+        'peerId': localPeerId,
+        'percent': overallProgressPercent,
+        'bytesTransferred': totalBytesTransferred,
+        'totalBytes': totalBytes,
+        'speedMbPerSec': currentSpeed,
+        'completedFiles': completed,
+        'totalFiles': items.length,
+      });
+
+      if (isAllCompleted && !_isCancelled) {
+        webSocketService!.send({
+          'type': 'TRANSFER_COMPLETED',
+          'sessionId': batchId,
+          'peerId': localPeerId,
+        });
+      }
+    }
   }
 }

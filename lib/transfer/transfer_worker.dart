@@ -1,3 +1,4 @@
+import '../models/transfer_failure_reason.dart';
 import 'dart:async';
 import '../models/chunk.dart';
 import '../models/peer.dart';
@@ -15,8 +16,9 @@ typedef OnChunkSuccess = void Function(
 typedef OnChunkFailure = void Function(
   int chunkId,
   String sourcePeerId,
-  String reason,
-);
+  String reason, {
+  TransferFailureReason? failureReason,
+});
 typedef SelectWorkCallback = ({ChunkMeta chunk, PeerInfo peer})? Function(String workerId);
 
 /// A parallel transfer worker that requests, streams, verifies, and commits chunks.
@@ -139,6 +141,7 @@ class TransferWorker {
           chunk.chunkId,
           peer.peerId,
           result.errorMessage ?? 'Download error',
+          failureReason: result.failureReason,
         );
       }
     }
