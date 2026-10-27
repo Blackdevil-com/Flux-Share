@@ -186,15 +186,22 @@ class TransferSessionManager {
     _serverReceiversSub = _activeServer!.connectedReceiversStream.listen((list) {
       final totalB = _activeBatchManifest?.totalBytes ?? 0;
       for (final cr in list) {
-        final currentP = _hostReceiverProgress[cr.peerId] ?? 0.0;
-        final currentB = _hostReceiverBytes[cr.peerId] ?? 0;
-        final clampedP = cr.progressPercent.clamp(0.0, 100.0);
-        final clampedB = totalB > 0
-            ? cr.bytesReceived.clamp(0, totalB)
-            : max(0, cr.bytesReceived);
+        if (_activeServer?.enableServedBytesAsProgressFallback == true) {
+          final currentP = _hostReceiverProgress[cr.peerId] ?? 0.0;
+          final currentB = _hostReceiverBytes[cr.peerId] ?? 0;
+          final clampedP = cr.progressPercent.clamp(0.0, 100.0);
+          final clampedB = totalB > 0
+              ? cr.bytesReceived.clamp(0, totalB)
+              : max(0, cr.bytesReceived);
 
-        _hostReceiverProgress[cr.peerId] = max(currentP, clampedP);
-        _hostReceiverBytes[cr.peerId] = max(currentB, clampedB);
+          _hostReceiverProgress[cr.peerId] = max(currentP, clampedP);
+          _hostReceiverBytes[cr.peerId] = max(currentB, clampedB);
+        } else {
+          // In confirmed-progress mode, ensure the receiver exists in progress tracking,
+          // but do not let server-served bytes override receiver-committed progress.
+          _hostReceiverProgress.putIfAbsent(cr.peerId, () => 0.0);
+          _hostReceiverBytes.putIfAbsent(cr.peerId, () => 0);
+        }
       }
       _updateHostSnapshot();
     });
@@ -428,20 +435,32 @@ class TransferSessionManager {
       }
     }
 
+    // Session validation: reject messages from previous / unrelated sessions
+    final incomingSessionId = msg['sessionId'] as String?;
+    if (incomingSessionId != null &&
+        incomingSessionId.isNotEmpty &&
+        _activeSessionId != null &&
+        incomingSessionId != _activeSessionId &&
+        incomingSessionId != _activeBatchManifest?.batchId) {
+      return;
+    }
+
     if (type == 'TRANSFER_PROGRESS') {
-      final rawPercent = (msg['percent'] as num?)?.toDouble();
+      final rawPercent = (msg['percent'] as num?)?.toDouble() ??
+          (msg['progress'] as num?)?.toDouble();
       final rawBytes = (msg['bytesTransferred'] as num?)?.toInt();
       final rawSpeed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
+          (msg['speedMBps'] as num?)?.toDouble() ??
           (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
 
       // Discard invalid / NaN inputs
-      if (rawPercent != null && (rawPercent.isNaN || rawPercent.isInfinite)) return;
+      if (rawPercent == null || rawPercent.isNaN || rawPercent.isInfinite || rawPercent < 0.0) return;
       if (rawSpeed.isNaN || rawSpeed.isInfinite) return;
 
       final totalBytes = _activeBatchManifest?.totalBytes ?? 0;
-      final clampedPercent = (rawPercent ?? 0.0).clamp(0.0, 100.0);
+      final clampedPercent = rawPercent.clamp(0.0, 100.0);
       final clampedBytes = totalBytes > 0
-          ? (rawBytes ?? 0).clamp(0, totalBytes)
+          ? (rawBytes ?? ((clampedPercent / 100.0) * totalBytes).round()).clamp(0, totalBytes)
           : max(0, rawBytes ?? 0);
 
       final currentProgress = _hostReceiverProgress[peerId] ?? 0.0;

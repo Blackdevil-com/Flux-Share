@@ -86,6 +86,21 @@ class LocalServer {
 
   final Map<String, Set<String>> _servedChunksByPeer = {};
   final Map<String, int> _bytesServedByPeer = {};
+  final Set<String> _webSocketConfirmedPeers = {};
+
+  /// Whether HTTP chunk requests generate served-byte progress events as a fallback.
+  /// When false (default), progress is strictly driven by receiver-confirmed reports
+  /// to keep sender and receiver transfer percentages synchronized exactly.
+  bool enableServedBytesAsProgressFallback = false;
+
+  /// Returns true if the receiver is connected or confirmed via the WebSocket control channel.
+  bool isWebSocketReceiver(String peerId) =>
+      _channelPeerMap.containsValue(peerId) || _webSocketConfirmedPeers.contains(peerId);
+
+  @visibleForTesting
+  void markReceiverAsWebSocketForTesting(String peerId) {
+    _webSocketConfirmedPeers.add(peerId);
+  }
 
   void updateReceiver(ConnectedReceiver receiver) {
     _connectedReceivers[receiver.peerId] = receiver;
@@ -95,6 +110,7 @@ class LocalServer {
   void clearReceivers({bool notify = true}) {
     _connectedReceivers.clear();
     _channelPeerMap.clear();
+    _webSocketConfirmedPeers.clear();
     _servedChunksByPeer.clear();
     _bytesServedByPeer.clear();
     _transferStarted = false;
@@ -220,33 +236,43 @@ class LocalServer {
       final currentBytes = (_bytesServedByPeer[targetPeerId] ?? 0) + chunkBytes;
       _bytesServedByPeer[targetPeerId] = currentBytes;
 
-      final totalBytes = _manifests.values.fold(0, (sum, m) => sum + m.fileSize);
-      final pct = totalBytes > 0
-          ? ((currentBytes / totalBytes) * 100.0).clamp(0.0, 100.0)
-          : 0.0;
+      final isWs = isWebSocketReceiver(targetPeerId);
 
-      final existing = _connectedReceivers[targetPeerId];
-      if (existing != null) {
-        final effectiveBytes = currentBytes > existing.bytesReceived ? currentBytes : existing.bytesReceived;
-        final effectivePct = pct > existing.progressPercent ? pct : existing.progressPercent;
-        final isComplete = effectivePct >= 100.0;
+      // For headless HTTP-only clients (no WebSocket confirmation channel),
+      // update ConnectedReceiver state so HTTP tests reflect chunk streaming.
+      // When a receiver is WebSocket-managed, its progress is strictly driven
+      // by confirmed WebSocket progress messages.
+      if (!isWs) {
+        final totalBytes = _manifests.values.fold(0, (sum, m) => sum + m.fileSize);
+        final pct = totalBytes > 0
+            ? ((currentBytes / totalBytes) * 100.0).clamp(0.0, 100.0)
+            : 0.0;
 
-        _connectedReceivers[targetPeerId] = existing.copyWith(
-          status: isComplete ? ReceiverStatus.completed : ReceiverStatus.receiving,
-          progressPercent: effectivePct,
-          bytesReceived: effectiveBytes,
-          lastSeen: DateTime.now(),
-        );
-        _connectedReceiversController.add(connectedReceivers);
+        final existing = _connectedReceivers[targetPeerId];
+        if (existing != null) {
+          final effectiveBytes = currentBytes > existing.bytesReceived ? currentBytes : existing.bytesReceived;
+          final effectivePct = pct > existing.progressPercent ? pct : existing.progressPercent;
+          final isComplete = effectivePct >= 100.0;
 
-        _notifyControlListeners({
-          'type': 'TRANSFER_PROGRESS',
-          'sessionId': _activeBatchId ?? '',
-          'peerId': targetPeerId,
-          'percent': effectivePct,
-          'bytesTransferred': effectiveBytes,
-          'totalBytes': totalBytes,
-        });
+          _connectedReceivers[targetPeerId] = existing.copyWith(
+            status: isComplete ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: effectivePct,
+            bytesReceived: effectiveBytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+
+          if (enableServedBytesAsProgressFallback) {
+            _notifyControlListeners({
+              'type': 'TRANSFER_PROGRESS',
+              'sessionId': _activeBatchId ?? '',
+              'peerId': targetPeerId,
+              'percent': effectivePct,
+              'bytesTransferred': effectiveBytes,
+              'totalBytes': totalBytes,
+            });
+          }
+        }
       }
     }
   }
@@ -614,6 +640,74 @@ class LocalServer {
       }
     });
 
+    // 5b. POST /transfer/progress (HTTP progress confirmation fallback)
+    router.post('/transfer/progress', (Request request) async {
+      final body = await request.readAsString();
+      try {
+        final parsed = jsonDecode(body) as Map<String, dynamic>;
+        parsed['type'] = 'TRANSFER_PROGRESS';
+        final peerId = parsed['peerId'] as String? ?? 'receiver';
+        final pct = (parsed['percent'] as num?)?.toDouble() ??
+            (parsed['progress'] as num?)?.toDouble() ??
+            0.0;
+        final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
+        final existing = _connectedReceivers[peerId];
+        if (existing != null && existing.status != ReceiverStatus.failed) {
+          _connectedReceivers[peerId] = existing.copyWith(
+            status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: pct,
+            bytesReceived: bytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        } else if (existing == null) {
+          _connectedReceivers[peerId] = ConnectedReceiver(
+            peerId: peerId,
+            deviceName: 'Receiver',
+            platform: DevicePlatform.Android,
+            status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: pct,
+            bytesReceived: bytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        }
+        _notifyControlListeners(parsed);
+        return Response.ok(
+          jsonEncode({'status': 'ok'}),
+          headers: {'content-type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.badRequest(body: 'Invalid progress report: $e');
+      }
+    });
+
+    // 5c. POST /transfer/completed (HTTP transfer completion confirmation fallback)
+    router.post('/transfer/completed', (Request request) async {
+      final body = await request.readAsString();
+      try {
+        final parsed = jsonDecode(body) as Map<String, dynamic>;
+        parsed['type'] = 'TRANSFER_COMPLETED';
+        final peerId = parsed['peerId'] as String? ?? 'receiver';
+        final existing = _connectedReceivers[peerId];
+        if (existing != null) {
+          _connectedReceivers[peerId] = existing.copyWith(
+            status: ReceiverStatus.completed,
+            progressPercent: 100.0,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        }
+        _notifyControlListeners(parsed);
+        return Response.ok(
+          jsonEncode({'status': 'ok'}),
+          headers: {'content-type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.badRequest(body: 'Invalid completion report: $e');
+      }
+    });
+
     // 6. WebSocket /ws
     final wsHandler = webSocketHandler((WebSocketChannel channel) async {
       _activeWsClients.add(channel);
@@ -648,6 +742,7 @@ class LocalServer {
 
             if (peerId != null) {
               _channelPeerMap[channel] = peerId;
+              _webSocketConfirmedPeers.add(peerId);
             }
 
             if (type == 'RECEIVER_JOINED' && peerId != null) {
@@ -697,11 +792,24 @@ class LocalServer {
               }
             } else if (type == 'TRANSFER_PROGRESS') {
               final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
-              final pct = (parsed['percent'] as num?)?.toDouble() ?? 0.0;
+              final pct = (parsed['percent'] as num?)?.toDouble() ??
+                  (parsed['progress'] as num?)?.toDouble() ??
+                  0.0;
               final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
               final existing = _connectedReceivers[activePeerId];
               if (existing != null && existing.status != ReceiverStatus.failed) {
                 _connectedReceivers[activePeerId] = existing.copyWith(
+                  status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+                  progressPercent: pct,
+                  bytesReceived: bytes,
+                  lastSeen: DateTime.now(),
+                );
+                _connectedReceiversController.add(connectedReceivers);
+              } else if (existing == null) {
+                _connectedReceivers[activePeerId] = ConnectedReceiver(
+                  peerId: activePeerId,
+                  deviceName: 'Receiver',
+                  platform: DevicePlatform.Android,
                   status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
                   progressPercent: pct,
                   bytesReceived: bytes,

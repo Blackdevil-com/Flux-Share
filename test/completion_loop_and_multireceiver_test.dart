@@ -26,6 +26,7 @@ void main() {
     await StoragePathService.customSaveDirectory!.create(recursive: true);
 
     hostServer = LocalServer();
+    hostServer.enableServedBytesAsProgressFallback = true;
     hostPort = await hostServer.start(preferredPort: 19891);
     hostServer.clearReceivers();
   });
