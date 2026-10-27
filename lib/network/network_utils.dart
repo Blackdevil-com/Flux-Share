@@ -1,6 +1,7 @@
 import 'dart:io';
 import 'dart:async';
 import 'package:flutter/foundation.dart';
+import '../peer/peer_manager.dart';
 
 /// Network utilities for interface detection, IP resolution, and reachability.
 class NetworkUtils {
@@ -189,6 +190,16 @@ class NetworkUtils {
     if (localIp == null || !localIp.startsWith('172.20.10.')) {
       targets.add(InternetAddress('172.20.10.1'));
     }
+
+    // Include known active peer IPs discovered in swarm / peer presence
+    try {
+      for (final peer in PeerManager().activePeers) {
+        final pip = peer.ip.trim();
+        if (isValidIpv4(pip) && pip != localIp) {
+          targets.add(InternetAddress(pip));
+        }
+      }
+    } catch (_) {}
 
     debugPrint('[FluxShare-Network] [DiscoveryTargets] Resolved targets for $localIp: '
         '${targets.map((t) => t.address).toList()}');
