@@ -196,6 +196,8 @@ class BatchTransferCoordinator {
         concurrentWorkers: concurrentWorkers,
         scheduler: scheduler,
         networkMode: networkMode,
+        notifyCompletionOnFinish: false, // Batch coordinator controls transfer completion
+        allowLegacyFallback: items.length == 1,
       );
       item.engine = engine;
       TransferRepository().registerEngine(item.fileId, engine);
@@ -234,12 +236,8 @@ class BatchTransferCoordinator {
         item.errorMessage = engine.lastErrorMessage ??
             engine.lastFailureReason?.toUserMessage() ??
             (item.errorMessage ?? 'Transfer failed');
-        if (!_isCancelled) {
-          webSocketService?.sendReceiverFailed(
-            peerId: localPeerId,
-            error: item.errorMessage ?? 'Transfer failed',
-          );
-        }
+        // Do NOT notify full receiver failure yet if other items are queued in the batch.
+        // Full failure is reported only after all items in the queue have been evaluated.
       }
 
       _recordHistory(item);
@@ -256,6 +254,13 @@ class BatchTransferCoordinator {
     if (!_isCancelled && !hasIncomplete) {
       if (_batchCompleter != null && !_batchCompleter!.isCompleted) {
         _batchCompleter!.complete(!hasFailed);
+      }
+      if (hasFailed) {
+        final failedCount = items.where((i) => i.status == TransferStatus.failed).length;
+        webSocketService?.sendReceiverFailed(
+          peerId: localPeerId,
+          error: 'Batch finished with $failedCount failed file${failedCount > 1 ? "s" : ""}',
+        );
       }
     }
 
@@ -295,6 +300,8 @@ class BatchTransferCoordinator {
       concurrentWorkers: concurrentWorkers,
       scheduler: scheduler,
       networkMode: networkMode,
+      notifyCompletionOnFinish: false,
+      allowLegacyFallback: items.length == 1,
     );
     item.engine = engine;
     TransferRepository().registerEngine(item.fileId, engine);

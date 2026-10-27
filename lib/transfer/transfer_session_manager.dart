@@ -94,6 +94,8 @@ class TransferSessionManager {
   final Map<String, double> _hostReceiverProgress = {};
   final Map<String, int> _hostReceiverBytes = {};
   final Map<String, double> _hostReceiverSpeed = {};
+  final Map<String, Set<String>> _hostReceiverCompletedFiles = {};
+  final Map<String, int> _hostReceiverCompletedCount = {};
   StreamSubscription? _serverReceiversSub;
   List<Device> _activeReceivers = [];
   FileInfo? _activeFileInfo;
@@ -164,6 +166,8 @@ class TransferSessionManager {
     _hostReceiverProgress.clear();
     _hostReceiverBytes.clear();
     _hostReceiverSpeed.clear();
+    _hostReceiverCompletedFiles.clear();
+    _hostReceiverCompletedCount.clear();
     _lastHostSnapshotTime = null;
     _lastHostBytesTransferred = 0;
     _lastEffectiveSpeed = 0.0;
@@ -186,15 +190,22 @@ class TransferSessionManager {
     _serverReceiversSub = _activeServer!.connectedReceiversStream.listen((list) {
       final totalB = _activeBatchManifest?.totalBytes ?? 0;
       for (final cr in list) {
-        final currentP = _hostReceiverProgress[cr.peerId] ?? 0.0;
-        final currentB = _hostReceiverBytes[cr.peerId] ?? 0;
-        final clampedP = cr.progressPercent.clamp(0.0, 100.0);
-        final clampedB = totalB > 0
-            ? cr.bytesReceived.clamp(0, totalB)
-            : max(0, cr.bytesReceived);
+        if (_activeServer?.enableServedBytesAsProgressFallback == true) {
+          final currentP = _hostReceiverProgress[cr.peerId] ?? 0.0;
+          final currentB = _hostReceiverBytes[cr.peerId] ?? 0;
+          final clampedP = cr.progressPercent.clamp(0.0, 100.0);
+          final clampedB = totalB > 0
+              ? cr.bytesReceived.clamp(0, totalB)
+              : max(0, cr.bytesReceived);
 
-        _hostReceiverProgress[cr.peerId] = max(currentP, clampedP);
-        _hostReceiverBytes[cr.peerId] = max(currentB, clampedB);
+          _hostReceiverProgress[cr.peerId] = max(currentP, clampedP);
+          _hostReceiverBytes[cr.peerId] = max(currentB, clampedB);
+        } else {
+          // In confirmed-progress mode, ensure the receiver exists in progress tracking,
+          // but do not let server-served bytes override receiver-committed progress.
+          _hostReceiverProgress.putIfAbsent(cr.peerId, () => 0.0);
+          _hostReceiverBytes.putIfAbsent(cr.peerId, () => 0);
+        }
       }
       _updateHostSnapshot();
     });
@@ -428,20 +439,40 @@ class TransferSessionManager {
       }
     }
 
+    // Session validation: reject messages from previous / unrelated sessions
+    final incomingSessionId = msg['sessionId'] as String?;
+    if (incomingSessionId != null &&
+        incomingSessionId.isNotEmpty &&
+        _activeSessionId != null &&
+        incomingSessionId != _activeSessionId &&
+        incomingSessionId != _activeBatchManifest?.batchId) {
+      return;
+    }
+
     if (type == 'TRANSFER_PROGRESS') {
-      final rawPercent = (msg['percent'] as num?)?.toDouble();
+      final rawPercent = (msg['percent'] as num?)?.toDouble() ??
+          (msg['progress'] as num?)?.toDouble();
       final rawBytes = (msg['bytesTransferred'] as num?)?.toInt();
       final rawSpeed = (msg['speedMbPerSec'] as num?)?.toDouble() ??
+          (msg['speedMBps'] as num?)?.toDouble() ??
           (((msg['speedBytesPerSec'] as num?)?.toDouble() ?? 0.0) / (1024 * 1024));
+      final completedFiles = (msg['completedFiles'] as num?)?.toInt();
+
+      if (completedFiles != null && completedFiles >= 0) {
+        _hostReceiverCompletedCount[peerId] = max(
+          _hostReceiverCompletedCount[peerId] ?? 0,
+          completedFiles,
+        );
+      }
 
       // Discard invalid / NaN inputs
-      if (rawPercent != null && (rawPercent.isNaN || rawPercent.isInfinite)) return;
+      if (rawPercent == null || rawPercent.isNaN || rawPercent.isInfinite || rawPercent < 0.0) return;
       if (rawSpeed.isNaN || rawSpeed.isInfinite) return;
 
       final totalBytes = _activeBatchManifest?.totalBytes ?? 0;
-      final clampedPercent = (rawPercent ?? 0.0).clamp(0.0, 100.0);
+      final clampedPercent = rawPercent.clamp(0.0, 100.0);
       final clampedBytes = totalBytes > 0
-          ? (rawBytes ?? 0).clamp(0, totalBytes)
+          ? (rawBytes ?? ((clampedPercent / 100.0) * totalBytes).round()).clamp(0, totalBytes)
           : max(0, rawBytes ?? 0);
 
       final currentProgress = _hostReceiverProgress[peerId] ?? 0.0;
@@ -463,9 +494,24 @@ class TransferSessionManager {
 
       _updateHostSnapshot();
     } else if (type == 'TRANSFER_COMPLETED') {
+      final fileId = msg['fileId'] as String?;
+      final isMultiFileBatch = _activeBatchManifest != null && _activeBatchManifest!.totalFiles > 1;
+
+      if (isMultiFileBatch && fileId != null) {
+        final set = _hostReceiverCompletedFiles.putIfAbsent(peerId, () => <String>{});
+        set.add(fileId);
+        _hostReceiverCompletedCount[peerId] = max(_hostReceiverCompletedCount[peerId] ?? 0, set.length);
+        if (set.length < _activeBatchManifest!.totalFiles) {
+          // A single file within the multi-file batch completed; do NOT mark the overall receiver completed yet.
+          _updateHostSnapshot();
+          return;
+        }
+      }
+
       _hostReceiverProgress[peerId] = 100.0;
       if (_activeBatchManifest != null) {
         _hostReceiverBytes[peerId] = _activeBatchManifest!.totalBytes;
+        _hostReceiverCompletedCount[peerId] = _activeBatchManifest!.totalFiles;
       }
       _updateHostSnapshot();
     } else if (type == 'RECEIVER_JOINED' || type == 'RECEIVER_READY') {
@@ -600,6 +646,13 @@ class TransferSessionManager {
       remainingSec = -1; // Waiting / unknown ETA
     }
 
+    int completedFiles = 0;
+    if (isAllCompleted) {
+      completedFiles = totalFiles;
+    } else if (_hostReceiverCompletedCount.isNotEmpty) {
+      completedFiles = _hostReceiverCompletedCount.values.reduce(min).clamp(0, totalFiles);
+    }
+
     _currentSnapshot = TransferProgressSnapshot(
       sessionId: _activeBatchManifest!.batchId,
       isHost: true,
@@ -611,7 +664,7 @@ class TransferSessionManager {
       bytesTransferred: isAllCompleted ? totalBytes : bytesTransferred,
       totalBytes: totalBytes,
       remainingSeconds: remainingSec,
-      completedFiles: isAllCompleted ? totalFiles : 0,
+      completedFiles: completedFiles,
       totalFiles: totalFiles,
       currentFileName: _activeFileInfo?.name ?? '',
       receiverProgressMap: Map.unmodifiable(_hostReceiverProgress),
@@ -741,6 +794,8 @@ class TransferSessionManager {
     _hostReceiverProgress.clear();
     _hostReceiverBytes.clear();
     _hostReceiverSpeed.clear();
+    _hostReceiverCompletedFiles.clear();
+    _hostReceiverCompletedCount.clear();
     _lastHostSnapshotTime = null;
     _lastHostBytesTransferred = 0;
     _lastEffectiveSpeed = 0.0;

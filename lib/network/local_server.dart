@@ -86,6 +86,22 @@ class LocalServer {
 
   final Map<String, Set<String>> _servedChunksByPeer = {};
   final Map<String, int> _bytesServedByPeer = {};
+  final Set<String> _webSocketConfirmedPeers = {};
+  final Map<String, Set<String>> _completedFilesByPeer = {};
+
+  /// Whether HTTP chunk requests generate served-byte progress events as a fallback.
+  /// When false (default), progress is strictly driven by receiver-confirmed reports
+  /// to keep sender and receiver transfer percentages synchronized exactly.
+  bool enableServedBytesAsProgressFallback = false;
+
+  /// Returns true if the receiver is connected or confirmed via the WebSocket control channel.
+  bool isWebSocketReceiver(String peerId) =>
+      _channelPeerMap.containsValue(peerId) || _webSocketConfirmedPeers.contains(peerId);
+
+  @visibleForTesting
+  void markReceiverAsWebSocketForTesting(String peerId) {
+    _webSocketConfirmedPeers.add(peerId);
+  }
 
   void updateReceiver(ConnectedReceiver receiver) {
     _connectedReceivers[receiver.peerId] = receiver;
@@ -95,6 +111,7 @@ class LocalServer {
   void clearReceivers({bool notify = true}) {
     _connectedReceivers.clear();
     _channelPeerMap.clear();
+    _webSocketConfirmedPeers.clear();
     _servedChunksByPeer.clear();
     _bytesServedByPeer.clear();
     _transferStarted = false;
@@ -140,6 +157,7 @@ class LocalServer {
     verifiedChunks.clear();
     verifiedChunks.addAll(newVerifiedChunks);
 
+    _completedFilesByPeer.clear();
     _primaryFileId = batch.first.manifest.fileId;
     _activeBatchId = batchId;
   }
@@ -155,6 +173,7 @@ class LocalServer {
     verifiedChunks.clear();
     _servedChunksByPeer.clear();
     _bytesServedByPeer.clear();
+    _completedFilesByPeer.clear();
   }
 
   void _notifyControlListeners(Map<String, dynamic> msg) {
@@ -220,33 +239,43 @@ class LocalServer {
       final currentBytes = (_bytesServedByPeer[targetPeerId] ?? 0) + chunkBytes;
       _bytesServedByPeer[targetPeerId] = currentBytes;
 
-      final totalBytes = _manifests.values.fold(0, (sum, m) => sum + m.fileSize);
-      final pct = totalBytes > 0
-          ? ((currentBytes / totalBytes) * 100.0).clamp(0.0, 100.0)
-          : 0.0;
+      final isWs = isWebSocketReceiver(targetPeerId);
 
-      final existing = _connectedReceivers[targetPeerId];
-      if (existing != null) {
-        final effectiveBytes = currentBytes > existing.bytesReceived ? currentBytes : existing.bytesReceived;
-        final effectivePct = pct > existing.progressPercent ? pct : existing.progressPercent;
-        final isComplete = effectivePct >= 100.0;
+      // For headless HTTP-only clients (no WebSocket confirmation channel),
+      // update ConnectedReceiver state so HTTP tests reflect chunk streaming.
+      // When a receiver is WebSocket-managed, its progress is strictly driven
+      // by confirmed WebSocket progress messages.
+      if (!isWs) {
+        final totalBytes = _manifests.values.fold(0, (sum, m) => sum + m.fileSize);
+        final pct = totalBytes > 0
+            ? ((currentBytes / totalBytes) * 100.0).clamp(0.0, 100.0)
+            : 0.0;
 
-        _connectedReceivers[targetPeerId] = existing.copyWith(
-          status: isComplete ? ReceiverStatus.completed : ReceiverStatus.receiving,
-          progressPercent: effectivePct,
-          bytesReceived: effectiveBytes,
-          lastSeen: DateTime.now(),
-        );
-        _connectedReceiversController.add(connectedReceivers);
+        final existing = _connectedReceivers[targetPeerId];
+        if (existing != null) {
+          final effectiveBytes = currentBytes > existing.bytesReceived ? currentBytes : existing.bytesReceived;
+          final effectivePct = pct > existing.progressPercent ? pct : existing.progressPercent;
+          final isComplete = effectivePct >= 100.0;
 
-        _notifyControlListeners({
-          'type': 'TRANSFER_PROGRESS',
-          'sessionId': _activeBatchId ?? '',
-          'peerId': targetPeerId,
-          'percent': effectivePct,
-          'bytesTransferred': effectiveBytes,
-          'totalBytes': totalBytes,
-        });
+          _connectedReceivers[targetPeerId] = existing.copyWith(
+            status: isComplete ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: effectivePct,
+            bytesReceived: effectiveBytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+
+          if (enableServedBytesAsProgressFallback) {
+            _notifyControlListeners({
+              'type': 'TRANSFER_PROGRESS',
+              'sessionId': _activeBatchId ?? '',
+              'peerId': targetPeerId,
+              'percent': effectivePct,
+              'bytesTransferred': effectiveBytes,
+              'totalBytes': totalBytes,
+            });
+          }
+        }
       }
     }
   }
@@ -411,13 +440,28 @@ class LocalServer {
     // 3a. GET /file/<fileId>/chunk/<chunkId> (Multi-file isolated streaming)
     router.get('/file/<fileId>/chunk/<chunkId>', (Request request, String fileId, String chunkIdStr) async {
       if (_activeBatchId == null) {
-        debugPrint('[FluxShare-Server] [404] Chunk rejected: No active batch');
-        return Response.notFound('No active batch');
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: No active batch for file $fileId, chunk $chunkIdStr');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'NO_ACTIVE_BATCH',
+            'message': 'No active batch on server',
+            'requestedFileId': fileId,
+            'requestedChunkId': chunkIdStr,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
       }
       final chunkId = int.tryParse(chunkIdStr);
       if (chunkId == null) {
-        debugPrint('[FluxShare-Server] [404] Chunk rejected: Invalid chunk ID "$chunkIdStr"');
-        return Response.notFound('Invalid chunk ID');
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Invalid chunk ID "$chunkIdStr" for file $fileId');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'INVALID_CHUNK_ID',
+            'message': 'Invalid chunk ID "$chunkIdStr"',
+            'requestedFileId': fileId,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
       }
 
       final decodedFileId = Uri.decodeComponent(fileId);
@@ -425,16 +469,61 @@ class LocalServer {
       final file = _sourceFiles[fileId] ?? _sourceFiles[decodedFileId];
       final activeFileId = _manifests.containsKey(fileId) ? fileId : decodedFileId;
 
-      if (m == null || file == null || !await file.exists()) {
-        final exists = file != null && await file.exists();
-        debugPrint('[FluxShare-Server] [404] Chunk rejected: Source file or manifest not available for file $fileId (decoded: $decodedFileId, manifestFound: ${m != null}, fileExists: $exists). Available: ${_manifests.keys.toList()}');
-        return Response.notFound('Source file or manifest not available for file $fileId');
+      if (m == null) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Manifest not found for file $fileId (decoded: $decodedFileId). Available: ${_manifests.keys.toList()}');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'MANIFEST_NOT_FOUND',
+            'message': 'Manifest not found for file $fileId',
+            'requestedFileId': fileId,
+            'decodedFileId': decodedFileId,
+            'availableFileIds': _manifests.keys.toList(),
+            'activeBatchId': _activeBatchId,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
       }
 
-      final fileChunks = _verifiedChunksByFile[activeFileId] ?? _verifiedChunksByFile[fileId] ?? verifiedChunks;
+      if (file == null) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Source file registration missing for file $fileId');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'SOURCE_FILE_MISSING',
+            'message': 'Source file registration missing for file $fileId',
+            'requestedFileId': fileId,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
+      }
+
+      if (!await file.exists()) {
+        debugPrint('[FluxShare-Server] [404] Chunk rejected: Source file does not exist on disk: ${file.path}');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'FILE_NOT_ON_DISK',
+            'message': 'Source file does not exist on disk',
+            'requestedFileId': fileId,
+            'path': file.path,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
+      }
+
+      final fileChunks = _verifiedChunksByFile[activeFileId] ??
+          _verifiedChunksByFile[fileId] ??
+          _verifiedChunksByFile[decodedFileId] ??
+          verifiedChunks;
       if (!fileChunks.contains(chunkId)) {
         debugPrint('[FluxShare-Server] [404] Chunk rejected: Chunk $chunkId for file $fileId not available on this peer. Verified count: ${fileChunks.length}');
-        return Response.notFound('Chunk $chunkId for file $fileId not available on this peer');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'CHUNK_UNAVAILABLE',
+            'message': 'Chunk $chunkId for file $fileId not available on this peer',
+            'requestedFileId': fileId,
+            'requestedChunkId': chunkId,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
       }
 
       final ChunkMeta chunk;
@@ -442,7 +531,15 @@ class LocalServer {
         chunk = m.chunks.firstWhere((c) => c.chunkId == chunkId);
       } catch (_) {
         debugPrint('[FluxShare-Server] [404] Chunk $chunkId not found in manifest for file $fileId');
-        return Response.notFound('Chunk $chunkId not found in manifest');
+        return Response.notFound(
+          jsonEncode({
+            'error': 'CHUNK_NOT_IN_MANIFEST',
+            'message': 'Chunk $chunkId not found in manifest for file $fileId',
+            'requestedFileId': fileId,
+            'requestedChunkId': chunkId,
+          }),
+          headers: {'content-type': 'application/json'},
+        );
       }
 
       final activeBatchId = _activeBatchId ?? '';
@@ -614,6 +711,94 @@ class LocalServer {
       }
     });
 
+    // 5b. POST /transfer/progress (HTTP progress confirmation fallback)
+    router.post('/transfer/progress', (Request request) async {
+      final body = await request.readAsString();
+      try {
+        final parsed = jsonDecode(body) as Map<String, dynamic>;
+        parsed['type'] = 'TRANSFER_PROGRESS';
+        final peerId = parsed['peerId'] as String? ?? 'receiver';
+        final pct = (parsed['percent'] as num?)?.toDouble() ??
+            (parsed['progress'] as num?)?.toDouble() ??
+            0.0;
+        final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
+        final existing = _connectedReceivers[peerId];
+        if (existing != null && existing.status != ReceiverStatus.failed) {
+          _connectedReceivers[peerId] = existing.copyWith(
+            status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: pct,
+            bytesReceived: bytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        } else if (existing == null) {
+          _connectedReceivers[peerId] = ConnectedReceiver(
+            peerId: peerId,
+            deviceName: 'Receiver',
+            platform: DevicePlatform.Android,
+            status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+            progressPercent: pct,
+            bytesReceived: bytes,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        }
+        _notifyControlListeners(parsed);
+        return Response.ok(
+          jsonEncode({'status': 'ok'}),
+          headers: {'content-type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.badRequest(body: 'Invalid progress report: $e');
+      }
+    });
+
+    // 5c. POST /transfer/completed (HTTP transfer completion confirmation fallback)
+    router.post('/transfer/completed', (Request request) async {
+      final body = await request.readAsString();
+      try {
+        final parsed = jsonDecode(body) as Map<String, dynamic>;
+        parsed['type'] = 'TRANSFER_COMPLETED';
+        final peerId = parsed['peerId'] as String? ?? 'receiver';
+        final fileId = parsed['fileId'] as String?;
+        final isMultiFileBatch = _manifests.length > 1;
+
+        if (isMultiFileBatch && fileId != null) {
+          final set = _completedFilesByPeer.putIfAbsent(peerId, () => <String>{});
+          set.add(fileId);
+          debugPrint('[FluxShare-Server] File $fileId completed for peer $peerId (${set.length}/${_manifests.length} batch files done)');
+          if (set.length < _manifests.length) {
+            _notifyControlListeners(parsed);
+            return Response.ok(
+              jsonEncode({
+                'status': 'file_completed',
+                'completedFiles': set.length,
+                'totalFiles': _manifests.length,
+              }),
+              headers: {'content-type': 'application/json'},
+            );
+          }
+        }
+
+        final existing = _connectedReceivers[peerId];
+        if (existing != null) {
+          _connectedReceivers[peerId] = existing.copyWith(
+            status: ReceiverStatus.completed,
+            progressPercent: 100.0,
+            lastSeen: DateTime.now(),
+          );
+          _connectedReceiversController.add(connectedReceivers);
+        }
+        _notifyControlListeners(parsed);
+        return Response.ok(
+          jsonEncode({'status': 'ok'}),
+          headers: {'content-type': 'application/json'},
+        );
+      } catch (e) {
+        return Response.badRequest(body: 'Invalid completion report: $e');
+      }
+    });
+
     // 6. WebSocket /ws
     final wsHandler = webSocketHandler((WebSocketChannel channel) async {
       _activeWsClients.add(channel);
@@ -648,6 +833,7 @@ class LocalServer {
 
             if (peerId != null) {
               _channelPeerMap[channel] = peerId;
+              _webSocketConfirmedPeers.add(peerId);
             }
 
             if (type == 'RECEIVER_JOINED' && peerId != null) {
@@ -697,7 +883,9 @@ class LocalServer {
               }
             } else if (type == 'TRANSFER_PROGRESS') {
               final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
-              final pct = (parsed['percent'] as num?)?.toDouble() ?? 0.0;
+              final pct = (parsed['percent'] as num?)?.toDouble() ??
+                  (parsed['progress'] as num?)?.toDouble() ??
+                  0.0;
               final bytes = (parsed['bytesTransferred'] as num?)?.toInt() ?? 0;
               final existing = _connectedReceivers[activePeerId];
               if (existing != null && existing.status != ReceiverStatus.failed) {
@@ -708,9 +896,33 @@ class LocalServer {
                   lastSeen: DateTime.now(),
                 );
                 _connectedReceiversController.add(connectedReceivers);
+              } else if (existing == null) {
+                _connectedReceivers[activePeerId] = ConnectedReceiver(
+                  peerId: activePeerId,
+                  deviceName: 'Receiver',
+                  platform: DevicePlatform.Android,
+                  status: pct >= 100.0 ? ReceiverStatus.completed : ReceiverStatus.receiving,
+                  progressPercent: pct,
+                  bytesReceived: bytes,
+                  lastSeen: DateTime.now(),
+                );
+                _connectedReceiversController.add(connectedReceivers);
               }
             } else if (type == 'TRANSFER_COMPLETED') {
               final activePeerId = peerId ?? _channelPeerMap[channel] ?? 'receiver';
+              final fileId = parsed['fileId'] as String?;
+              final isMultiFileBatch = _manifests.length > 1;
+
+              if (isMultiFileBatch && fileId != null) {
+                final set = _completedFilesByPeer.putIfAbsent(activePeerId, () => <String>{});
+                set.add(fileId);
+                debugPrint('[FluxShare-Server] WS File $fileId completed for peer $activePeerId (${set.length}/${_manifests.length} batch files done)');
+                if (set.length < _manifests.length) {
+                  _notifyControlListeners(parsed);
+                  return; // Don't mark receiver completed yet!
+                }
+              }
+
               final existing = _connectedReceivers[activePeerId];
               if (existing != null) {
                 _connectedReceivers[activePeerId] = existing.copyWith(

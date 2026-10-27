@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:crypto/crypto.dart';
 import '../file/chunk_manager.dart';
@@ -118,9 +119,17 @@ class ChunkDownloader {
       if (response.statusCode != HttpStatus.ok) {
         stopwatch.stop();
         peer.recordFailure();
+        String detail = '';
+        try {
+          final bodyBytes = await response.fold<List<int>>(<int>[], (p, e) => p..addAll(e));
+          detail = utf8.decode(bodyBytes, allowMalformed: true).trim();
+        } catch (_) {}
         final reason = response.statusCode == HttpStatus.notFound
             ? TransferFailureReason.notFound
             : TransferFailureReason.httpError;
+        final errorMsg = detail.isNotEmpty
+            ? 'HTTP ${response.statusCode} from ${peer.peerId}: $detail'
+            : 'HTTP ${response.statusCode} from ${peer.peerId}';
         return ChunkDownloadResult(
           chunkId: chunkMeta.chunkId,
           success: false,
@@ -129,7 +138,7 @@ class ChunkDownloader {
           duration: stopwatch.elapsed,
           statusCode: response.statusCode,
           failureReason: reason,
-          errorMessage: 'HTTP ${response.statusCode} from ${peer.peerId}',
+          errorMessage: errorMsg,
         );
       }
 

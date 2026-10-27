@@ -28,6 +28,7 @@ class TransferWorker {
   final String workerId;
   final String? fileId;
   final String? localPeerId;
+  final bool allowLegacyFallback;
   final ReservationManager reservationManager;
   final ChunkWriterSession writerSession;
   final ChunkDownloader downloader;
@@ -43,6 +44,7 @@ class TransferWorker {
     required this.workerId,
     this.fileId,
     this.localPeerId,
+    this.allowLegacyFallback = false,
     required this.reservationManager,
     required this.writerSession,
     required this.downloader,
@@ -114,7 +116,7 @@ class TransferWorker {
           writerSession: writerSession,
           fileId: fileId,
           localPeerId: localPeerId,
-          allowLegacyFallback: true,
+          allowLegacyFallback: allowLegacyFallback,
         );
       } catch (e) {
         result = ChunkDownloadResult(
