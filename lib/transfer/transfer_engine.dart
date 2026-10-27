@@ -63,6 +63,8 @@ class TransferEngine {
   final String localPeerId;
   final String coordinatorPeerId;
   final String networkMode;
+  final bool notifyCompletionOnFinish;
+  final bool allowLegacyFallback;
 
   late final ReservationManager _reservationManager;
   late final ChunkWriterSession _writerSession;
@@ -101,6 +103,8 @@ class TransferEngine {
     required this.coordinatorPeerId,
     this.concurrentWorkers = 5,
     this.networkMode = 'wifi',
+    this.notifyCompletionOnFinish = true,
+    this.allowLegacyFallback = false,
     ChunkScheduler? scheduler,
   }) : scheduler = scheduler ?? RoundRobinScheduler() {
     _reservationManager = ReservationManager();
@@ -206,6 +210,7 @@ class TransferEngine {
           workerId: 'worker_$i',
           fileId: manifest.fileId,
           localPeerId: localPeerId,
+          allowLegacyFallback: allowLegacyFallback,
           reservationManager: _reservationManager,
           writerSession: _writerSession,
           downloader: _sharedDownloader,
@@ -490,9 +495,11 @@ class TransferEngine {
       await StoragePathService.scanFile(destinationFile.path);
     } catch (_) {}
 
-    try {
-      webSocketService?.notifyTransferCompleted(fileId: manifest.fileId);
-    } catch (_) {}
+    if (notifyCompletionOnFinish) {
+      try {
+        webSocketService?.notifyTransferCompleted(fileId: manifest.fileId);
+      } catch (_) {}
+    }
 
     _emitProgress();
     if (_completionCompleter != null && !_completionCompleter!.isCompleted) {

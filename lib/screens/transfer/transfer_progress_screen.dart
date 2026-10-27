@@ -299,6 +299,13 @@ class _TransferProgressScreenState extends State<TransferProgressScreen> {
         }
       });
     } else if (type == 'TRANSFER_COMPLETED') {
+      final fileId = msg['fileId'] as String?;
+      final totalFiles = _batchEvent?.totalFiles ??
+          (widget.batchManifest?.totalFiles ?? 1);
+      if (totalFiles > 1 && fileId != null) {
+        // Individual file in multi-file batch completed, not the entire batch.
+        return;
+      }
       setState(() {
         _receiverProgressMap[peerId] = 100.0;
         if (_receiverProgressMap.isNotEmpty) {
